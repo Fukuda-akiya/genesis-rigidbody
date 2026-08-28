@@ -1,8 +1,5 @@
 /* src/config.h.in.  Generated from configure.ac by autoheader.  */
 
-/* Defined if BD is used. */
-#undef BLACS
-
 /* c compiler version */
 #undef COMPILE_CC_VER
 
@@ -66,12 +63,6 @@
 /* Define to 1 if you have the <inttypes.h> header file. */
 #undef HAVE_INTTYPES_H
 
-/* Define to 1 if you have the `mpi' library (-lmpi). */
-#undef HAVE_LIBMPI
-
-/* Define to 1 if you have the <memory.h> header file. */
-#undef HAVE_MEMORY_H
-
 /* defined if MPI is used. */
 #undef HAVE_MPI_GENESIS
 
@@ -80,6 +71,9 @@
 
 /* Define to 1 if you have the <stdint.h> header file. */
 #undef HAVE_STDINT_H
+
+/* Define to 1 if you have the <stdio.h> header file. */
+#undef HAVE_STDIO_H
 
 /* Define to 1 if you have the <stdlib.h> header file. */
 #undef HAVE_STDLIB_H
@@ -107,12 +101,6 @@
 
 /* defined if Intel compiler is used. */
 #undef INTEL
-
-/* defined if INTERNAL LAPACK is used. */
-#undef INTERNAL_LAPACK
-
-/* defined if INTERNAL SCALAPACK is used. */
-#undef INTERNAL_SCALAPACK
 
 /* defined if K-computer compiler is used. */
 #undef KCOMP
@@ -159,7 +147,9 @@
 /* defined if QSimulate is used. */
 #undef QSIMULATE
 
-/* Define to 1 if you have the ANSI C header files. */
+/* Define to 1 if all of the C89 standard headers exist (not just the ones
+   required in a freestanding environment). This macro is provided for
+   backward compatibility; new code need not use it. */
 #undef STDC_HEADERS
 
 /* defined if gpu is used. */

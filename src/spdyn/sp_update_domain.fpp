@@ -26,6 +26,7 @@ module sp_update_domain_mod
   use sp_pairlist_str_mod
   use sp_enefunc_str_mod
   use sp_domain_str_mod
+  use rigidbody_str_mod
   use timers_mod
   use messages_mod
   use mpi_parallel_mod
@@ -59,7 +60,8 @@ contains
   !======1=========2=========3=========4=========5=========6=========7=========8
 
   subroutine domain_interaction_update(istep, update_period, domain, enefunc, &
-                                       pairlist, boundary, constraints, comm)
+                                       pairlist, boundary, constraints, comm, &
+                                       rigidbody)
 
     ! formal arguments
     integer,                 intent(in)    :: istep
@@ -70,6 +72,7 @@ contains
     type(s_boundary),        intent(inout) :: boundary
     type(s_constraints),     intent(inout) :: constraints
     type(s_comm),            intent(inout) :: comm
+    type(s_rigidbody), optional, intent(in) :: rigidbody
 
     ! local variable
     integer                  :: ncell, nb, water_atom
@@ -114,12 +117,22 @@ contains
 
         call alloc_enefunc(enefunc, EneFuncBondCell, ncell, ncell+nb)
 
+        if (present(rigidbody)) then
+          if (rigidbody%is_used) &
+            call alloc_domain(domain, DomainRigidBodyMove, ncell+nb, ncell, &
+                              rigidbody%max_natom)
+        end if
+
       end if
 
       call timer(TimerUpdate, TimerOn)
       call update_outgoing_atom (boundary, constraints, domain)
       call update_outgoing_HGr  (boundary, constraints, domain)
       call update_outgoing_water(water_atom, boundary, domain)
+      if (present(rigidbody)) then
+        if (rigidbody%is_used) &
+          call update_outgoing_rigidbody(rigidbody, boundary, domain)
+      end if
 
       call timer(TimerComm3, TimerOn)
       call communicate_constraints(domain, comm, constraints)
@@ -128,6 +141,10 @@ contains
       call update_incoming_atom (constraints, domain)
       call update_incoming_HGr  (constraints, domain)
       call update_incoming_water(water_atom, domain)
+      if (present(rigidbody)) then
+        if (rigidbody%is_used) &
+          call update_incoming_rigidbody(rigidbody, domain)
+      end if
 
       call update_cell_size_constraints    (domain, comm, constraints)
       call update_cell_boundary(domain, comm, boundary, constraints)

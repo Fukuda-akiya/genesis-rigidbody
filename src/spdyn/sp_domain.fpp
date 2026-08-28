@@ -26,6 +26,7 @@ module sp_domain_mod
   use sp_pairlist_str_mod
   use sp_enefunc_str_mod
   use sp_domain_str_mod
+  use rigidbody_str_mod
   use molecules_str_mod
   use hardwareinfo_mod
   use molecules_mod
@@ -98,7 +99,8 @@ contains
   !======1=========2=========3=========4=========5=========6=========7=========8
 
   subroutine setup_domain(ene_info, con_info, &
-                          boundary, molecule, enefunc, constraints, domain)
+                          boundary, molecule, enefunc, constraints, domain, &
+                          rigidbody)
 
     ! formal arguments
     type(s_ene_info),        intent(in)    :: ene_info
@@ -108,6 +110,7 @@ contains
     type(s_enefunc),         intent(inout) :: enefunc
     type(s_constraints),     intent(inout) :: constraints
     type(s_domain),          intent(inout) :: domain
+    type(s_rigidbody), optional, intent(in) :: rigidbody
 
     ! local variables
     integer                  :: i, j, k, cell(3)
@@ -240,8 +243,19 @@ contains
     end if
 
     call setup_hbond_group     (molecule, domain, enefunc, constraints)
+
+    if (present(rigidbody)) then
+      if (rigidbody%is_used) call mark_rigidbody_atoms(constraints, rigidbody)
+    end if
+
     call setup_atom_by_HBond   (molecule, boundary, enefunc, constraints, &
                                 domain)
+
+    if (present(rigidbody)) then
+      if (rigidbody%is_used) &
+        call setup_atom_by_rigidbody(molecule, boundary, rigidbody, domain)
+    end if
+
     call setup_global_to_local_atom_index(enefunc, domain)
 
 !   call setup_ring_check      (molecule, enefunc, constraints, domain)
@@ -3095,6 +3109,182 @@ contains
     return
 
   end subroutine setup_atom_by_HBond
+
+  !======1=========2=========3=========4=========5=========6=========7=========8
+  !
+  !  Subroutine    mark_rigidbody_atoms
+  !> @brief        mark rigid-body member atoms as already "claimed" so that
+  !!               setup_atom_by_HBond's plain solute-atom loop skips them
+  !!               (they are placed as a group by setup_atom_by_rigidbody
+  !!               instead, each independently assigned would scatter a
+  !!               rigid body's atoms across cells)
+  !! @authors      Genesis Developers
+  !! @param[inout] constraints : constraints information
+  !! @param[in]    rigidbody   : rigid-body information
+  !
+  !======1=========2=========3=========4=========5=========6=========7=========8
+
+  subroutine mark_rigidbody_atoms(constraints, rigidbody)
+
+    ! formal arguments
+    type(s_constraints),      intent(inout) :: constraints
+    type(s_rigidbody),        intent(in)    :: rigidbody
+
+    ! local variables
+    integer                   :: ib, i, iatm
+
+
+    do ib = 1, rigidbody%num_bodies
+      do i = 1, rigidbody%natom(ib)
+
+        iatm = rigidbody%atomlist(i,ib)
+
+        if (constraints%duplicate(iatm) /= 0) &
+          call error_msg('Mark_Rigidbody_Atoms> a [RIGIDBODY] atom is '// &
+                          'already part of a SHAKE/SETTLE-constrained '// &
+                          'hydrogen or water group; overlap between '//   &
+                          '[RIGIDBODY] and such groups is not supported')
+
+        constraints%duplicate(iatm) = 1
+
+      end do
+    end do
+
+    return
+
+  end subroutine mark_rigidbody_atoms
+
+  !======1=========2=========3=========4=========5=========6=========7=========8
+  !
+  !  Subroutine    setup_atom_by_rigidbody
+  !> @brief        assign every member atom of each rigid body to the single
+  !!               cell chosen from the body's representative (first) atom,
+  !!               mirroring how setup_atom_by_HBond co-locates water/H-bond
+  !!               groups; also initializes each body's per-cell runtime
+  !!               state (orientation quaternion, angular momentum)
+  !! @authors      Genesis Developers
+  !! @param[in]    molecule  : molecule information
+  !! @param[in]    boundary  : boundary condition information
+  !! @param[in]    rigidbody : rigid-body information
+  !! @param[inout] domain    : domain information
+  !
+  !======1=========2=========3=========4=========5=========6=========7=========8
+
+  subroutine setup_atom_by_rigidbody(molecule, boundary, rigidbody, domain)
+
+    ! formal arguments
+    type(s_molecule),    target, intent(in)    :: molecule
+    type(s_boundary),    target, intent(in)    :: boundary
+    type(s_rigidbody),           intent(in)    :: rigidbody
+    type(s_domain),      target, intent(inout) :: domain
+
+    ! local variables
+    real(wip)                    :: shift(3), bsize(3), csize(3), move(3)
+    real(wip)                    :: origin(3)
+    integer                      :: ic(1:3), icel, num_cell(3)
+    integer                      :: ib, i, iatm, icel_local
+    integer                      :: ncel_local, ncel, patm, prb
+    integer                      :: dupl(3)
+
+    integer,             pointer :: natom(:)
+    integer(int2),       pointer :: cell_g2l(:), cell_g2b(:)
+
+
+    if (rigidbody%num_bodies == 0) return
+
+    if (boundary%num_duplicate(1) /= 1 .or. &
+        boundary%num_duplicate(2) /= 1 .or. &
+        boundary%num_duplicate(3) /= 1)      &
+      call error_msg('Setup_Atom_By_Rigidbody> [RIGIDBODY] is not '// &
+                      'supported together with domain duplication '// &
+                      '(num_duplicate > 1)')
+
+    ncel_local = domain%num_cell_local
+    ncel       = ncel_local + domain%num_cell_boundary
+
+    MaxRigidBody = max(1, rigidbody%num_bodies)
+    call alloc_domain(domain, DomainRigidBody, ncel, rigidbody%max_natom, 1)
+
+    cell_g2l => domain%cell_g2l
+    cell_g2b => domain%cell_g2b
+    natom    => domain%num_atom
+
+    bsize(1)    = boundary%box_size_x
+    bsize(2)    = boundary%box_size_y
+    bsize(3)    = boundary%box_size_z
+    csize(1)    = boundary%cell_size_x
+    csize(2)    = boundary%cell_size_y
+    csize(3)    = boundary%cell_size_z
+    num_cell(1) = boundary%num_cells_x
+    num_cell(2) = boundary%num_cells_y
+    num_cell(3) = boundary%num_cells_z
+    origin(1)   = boundary%origin_x
+    origin(2)   = boundary%origin_y
+    origin(3)   = boundary%origin_z
+    dupl(1:3)   = 1
+
+    do ib = 1, rigidbody%num_bodies
+
+      ! the body's representative (first) atom decides which cell the
+      ! whole body belongs to
+      !
+      i = rigidbody%atomlist(1,ib)
+
+      shift(1:3) = molecule%atom_coord(1:3,i) - origin(1:3)
+      move(1:3)  = bsize(1:3)*0.5_wip - bsize(1:3)*anint(shift(1:3)/bsize(1:3))
+      shift(1:3) = shift(1:3) + move(1:3)
+
+      ic(1:3) = int(shift(1:3)/csize(1:3))
+      if (ic(1) == num_cell(1)) ic(1) = ic(1) - 1
+      if (ic(2) == num_cell(2)) ic(2) = ic(2) - 1
+      if (ic(3) == num_cell(3)) ic(3) = ic(3) - 1
+      icel = 1 + ic(1) + ic(2)*num_cell(1) + ic(3)*num_cell(1)*num_cell(2)
+
+      if (cell_g2l(icel) /= 0) then
+        icel_local = cell_g2l(icel)
+      else if (cell_g2b(icel) /= 0) then
+        icel_local = cell_g2b(icel) + ncel_local
+      else
+        cycle   ! this rank does not own (or border) this body's home cell
+      end if
+
+      prb = domain%num_rigidbody(icel_local) + 1
+      if (prb > MaxRigidBody) &
+        call error_msg('Setup_Atom_By_Rigidbody> too many rigid bodies '// &
+                        'assigned to one cell')
+
+      domain%rigidbody_id     (prb,icel_local)   = ib
+      domain%rigidbody_quat   (1,prb,icel_local) = 1.0_wip
+      domain%rigidbody_quat   (2:4,prb,icel_local) = 0.0_wip
+      domain%rigidbody_angmom (1:3,prb,icel_local) = 0.0_wip
+
+      do i = 1, rigidbody%natom(ib)
+
+        iatm = rigidbody%atomlist(i,ib)
+        patm = natom(icel_local) + 1
+
+        if (patm > MaxAtom) &
+          call error_msg('Setup_Atom_By_Rigidbody> too many atoms in one '// &
+                          'cell after adding a rigid body -- increase the '//&
+                          'cell size or reduce the rigid-body size')
+
+        domain%rigidbody_atom(i,prb,icel_local) = patm
+
+        call molecule_to_domain(molecule, move, origin, iatm, &
+                                domain, icel_local, patm,      &
+                                dupl, bsize, 0)
+
+        natom(icel_local) = patm
+
+      end do
+
+      domain%num_rigidbody(icel_local) = prb
+
+    end do
+
+    return
+
+  end subroutine setup_atom_by_rigidbody
 
   !======1=========2=========3=========4=========5=========6=========7=========8
   !

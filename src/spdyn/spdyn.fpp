@@ -36,6 +36,7 @@ program spdyn
   use sp_pairlist_str_mod
   use sp_enefunc_str_mod
   use sp_domain_str_mod
+  use rigidbody_str_mod
   use sp_remd_str_mod
   use sp_rpath_str_mod
   use sp_remd_mod
@@ -84,6 +85,7 @@ program spdyn
   integer                     :: omp_get_max_threads, i
   real(dp)                    :: sas, eae
   type(s_alchemy)             :: alchemy
+  type(s_rigidbody)           :: rigidbody
 
 #ifdef HAVE_MPI_GENESIS
   call mpi_init(ierror)
@@ -278,7 +280,7 @@ contains
 
       call setup_spdyn_md(ctrl_data, output, molecule, enefunc, pairlist,    &
                          dynvars, dynamics, constraints, ensemble, boundary, &
-                         domain, comm)
+                         domain, comm, rigidbody=rigidbody)
 
     case (GenesisMIN)
 
@@ -360,7 +362,7 @@ contains
       end if
 
       call run_md(output, domain, enefunc, dynvars, dynamics, pairlist, &
-                  boundary, constraints, ensemble, comm, remd)
+                  boundary, constraints, ensemble, comm, remd, rigidbody)
     
     case (GenesisMIN)
 

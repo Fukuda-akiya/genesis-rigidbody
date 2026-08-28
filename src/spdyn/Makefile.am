@@ -89,6 +89,7 @@ spdyn_SOURCES = \
 	sp_enefunc_gamd.fpp \
 	sp_enefunc.fpp \
 	sp_constraints.fpp \
+	sp_rigidbody.fpp \
 	sp_restraints.fpp \
 	sp_ensemble.fpp \
 	sp_domain.fpp \
@@ -191,6 +192,7 @@ prst_setup_SOURCES = \
 	sp_enefunc_gamd.fpp \
 	sp_enefunc.fpp \
 	sp_constraints.fpp \
+	sp_rigidbody.fpp \
 	sp_restraints.fpp \
 	sp_ensemble.fpp \
 	sp_domain.fpp \

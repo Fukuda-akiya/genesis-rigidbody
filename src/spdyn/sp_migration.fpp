@@ -18,6 +18,7 @@ module sp_migration_mod
   use sp_boundary_str_mod
   use sp_enefunc_str_mod
   use sp_domain_str_mod
+  use rigidbody_str_mod
   use messages_mod
   use mpi_parallel_mod
   use constants_mod
@@ -32,6 +33,8 @@ module sp_migration_mod
   public :: update_incoming_atom
   public :: update_incoming_water
   public :: update_incoming_HGr
+  public :: update_outgoing_rigidbody
+  public :: update_incoming_rigidbody
   public :: update_enefunc_enm
   public :: update_outgoing_enefunc_bond
   public :: update_incoming_enefunc_bond
@@ -870,6 +873,311 @@ contains
     return
 
   end subroutine update_incoming_water
+
+  !======1=========2=========3=========4=========5=========6=========7=========8
+  !
+  !  Subroutine    update_outgoing_rigidbody
+  !> @brief        check rigid-body particles going/remaining cells
+  !! @authors      Genesis Developers
+  !! @param[in]    rigidbody : rigid-body information (global, replicated)
+  !! @param[in]    boundary  : boundary condition information
+  !! @param[inout] domain    : domain information
+  !
+  !======1=========2=========3=========4=========5=========6=========7=========8
+
+  subroutine update_outgoing_rigidbody(rigidbody, boundary, domain)
+
+    ! formal arguments
+    type(s_rigidbody), target, intent(in)    :: rigidbody
+    type(s_boundary),  target, intent(in)    :: boundary
+    type(s_domain),    target, intent(inout) :: domain
+
+    ! local variable
+    real(wip)                  :: x_shift, y_shift, z_shift
+    real(wip)                  :: move(3)
+    integer                    :: i, pb, ib, irep
+    integer                    :: icx, icy, icz, icel, ncel
+    integer                    :: icel_local, icel_bd
+
+    real(wip),          pointer :: bsize_x, bsize_y, bsize_z
+    real(wip),          pointer :: csize_x, csize_y, csize_z
+    real(wip),          pointer :: coord(:,:,:)
+    real(wip),          pointer :: rb_move_real(:,:,:), rb_stay_real(:,:,:)
+    integer,            pointer :: ncel_x, ncel_y, ncel_z, ncel_local, ncel_bd
+    integer,            pointer :: num_rigidbody(:), rigidbody_id(:,:)
+    integer(int2),      pointer :: cell_g2l(:), cell_g2b(:)
+    integer,            pointer :: rb_move(:), rb_stay(:)
+    integer,            pointer :: rb_move_int(:,:,:), rb_stay_int(:,:,:)
+
+
+    bsize_x        => boundary%box_size_x
+    bsize_y        => boundary%box_size_y
+    bsize_z        => boundary%box_size_z
+    ncel_x         => boundary%num_cells_x
+    ncel_y         => boundary%num_cells_y
+    ncel_z         => boundary%num_cells_z
+    csize_x        => boundary%cell_size_x
+    csize_y        => boundary%cell_size_y
+    csize_z        => boundary%cell_size_z
+
+    ncel_local     => domain%num_cell_local
+    ncel_bd        => domain%num_cell_boundary
+    num_rigidbody  => domain%num_rigidbody
+    rigidbody_id   => domain%rigidbody_id
+    cell_g2l       => domain%cell_g2l
+    cell_g2b       => domain%cell_g2b
+    coord          => domain%coord
+    rb_move        => domain%rigidbody%move
+    rb_stay        => domain%rigidbody%stay
+    rb_move_real   => domain%rigidbody%move_real
+    rb_stay_real   => domain%rigidbody%stay_real
+    rb_move_int    => domain%rigidbody%move_integer
+    rb_stay_int    => domain%rigidbody%stay_integer
+
+
+    ncel = ncel_local + ncel_bd
+    rb_stay(1:ncel_local) = 0
+    rb_move(1:ncel)       = 0
+
+    do i = 1, ncel_local
+
+      do pb = 1, num_rigidbody(i)
+
+        ib   = rigidbody_id(pb,i)
+        irep = domain%rigidbody_atom(1,pb,i)   ! representative member atom
+
+        x_shift = coord(1,irep,i) - boundary%origin_x
+        y_shift = coord(2,irep,i) - boundary%origin_y
+        z_shift = coord(3,irep,i) - boundary%origin_z
+
+        move(1) = bsize_x*0.5_wip - bsize_x*anint(x_shift/bsize_x)
+        move(2) = bsize_y*0.5_wip - bsize_y*anint(y_shift/bsize_y)
+        move(3) = bsize_z*0.5_wip - bsize_z*anint(z_shift/bsize_z)
+
+        x_shift = x_shift + move(1)
+        y_shift = y_shift + move(2)
+        z_shift = z_shift + move(3)
+
+        icx = int(x_shift/csize_x)
+        icy = int(y_shift/csize_y)
+        icz = int(z_shift/csize_z)
+        if (icx == ncel_x) icx = icx - 1
+        if (icy == ncel_y) icy = icy - 1
+        if (icz == ncel_z) icz = icz - 1
+        icel = 1 + icx + icy*ncel_x + icz*ncel_x*ncel_y
+        icel_local = cell_g2l(icel)
+        icel_bd    = cell_g2b(icel)
+
+        if (icel_local /= i) then
+
+          if (icel_local /= 0) then
+            rb_move(icel_local) = rb_move(icel_local) + 1
+            call pack_rigidbody(rigidbody, domain, ib, pb, i, &
+                    rb_move_real(:,rb_move(icel_local),icel_local))
+            rb_move_int(1,rb_move(icel_local),icel_local) = ib
+          else if (icel_bd /= 0) then
+            icel_bd = icel_bd + ncel_local
+            rb_move(icel_bd) = rb_move(icel_bd) + 1
+            call pack_rigidbody(rigidbody, domain, ib, pb, i, &
+                    rb_move_real(:,rb_move(icel_bd),icel_bd))
+            rb_move_int(1,rb_move(icel_bd),icel_bd) = ib
+          end if
+
+        else
+
+          rb_stay(i) = rb_stay(i) + 1
+          call pack_rigidbody(rigidbody, domain, ib, pb, i, &
+                  rb_stay_real(:,rb_stay(i),i))
+          rb_stay_int(1,rb_stay(i),i) = ib
+
+        end if
+
+      end do
+
+    end do
+
+    return
+
+  end subroutine update_outgoing_rigidbody
+
+  !======1=========2=========3=========4=========5=========6=========7=========8
+  !
+  !  Subroutine    pack_rigidbody
+  !> @brief        pack one rigid body's current per-atom coord/velocity and
+  !!               its own COM/orientation/momentum state into a migration
+  !!               buffer slot (layout: 6 reals per member atom, up to
+  !!               max_natom, followed by 13 body-level values -- the fixed
+  !!               max_natom stride is used for the trailing offset so it
+  !!               matches on both the packing and unpacking side even
+  !!               though a body's own natom(ib) may be smaller)
+  !! @authors      Genesis Developers
+  !
+  !======1=========2=========3=========4=========5=========6=========7=========8
+
+  subroutine pack_rigidbody(rigidbody, domain, ib, pb, icel, buf)
+
+    ! formal arguments
+    type(s_rigidbody), intent(in)  :: rigidbody
+    type(s_domain),     intent(in)  :: domain
+    integer,            intent(in)  :: ib, pb, icel
+    real(wip),          intent(out) :: buf(:)
+
+    ! local variables
+    integer                 :: k, ix, n, mn
+
+
+    n  = rigidbody%natom(ib)
+    mn = rigidbody%max_natom
+
+    do k = 1, n
+      ix = domain%rigidbody_atom(k,pb,icel)
+      buf(6*(k-1)+1) = domain%coord(1,ix,icel)
+      buf(6*(k-1)+2) = domain%coord(2,ix,icel)
+      buf(6*(k-1)+3) = domain%coord(3,ix,icel)
+      buf(6*(k-1)+4) = domain%velocity(1,ix,icel)
+      buf(6*(k-1)+5) = domain%velocity(2,ix,icel)
+      buf(6*(k-1)+6) = domain%velocity(3,ix,icel)
+    end do
+
+    buf(6*mn+1:6*mn+3)  = domain%rigidbody_com     (1:3,pb,icel)
+    buf(6*mn+4:6*mn+6)  = domain%rigidbody_vel_com (1:3,pb,icel)
+    buf(6*mn+7:6*mn+10) = domain%rigidbody_quat    (1:4,pb,icel)
+    buf(6*mn+11:6*mn+13)= domain%rigidbody_angmom  (1:3,pb,icel)
+
+    return
+
+  end subroutine pack_rigidbody
+
+  !======1=========2=========3=========4=========5=========6=========7=========8
+  !
+  !  Subroutine    update_incoming_rigidbody
+  !> @brief        check rigid-body particles incoming cells; this always
+  !!               rebuilds each cell's rigid-body bookkeeping (num_rigidbody,
+  !!               rigidbody_id, rigidbody_atom local slots) from the
+  !!               stay/move staging buffers, the same way water is rebuilt
+  !!               by update_incoming_water -- it must therefore run AFTER
+  !!               update_incoming_water, appending onto domain%num_atom
+  !! @authors      Genesis Developers
+  !! @param[in]    rigidbody : rigid-body information (global, replicated)
+  !! @param[inout] domain    : domain information
+  !
+  !======1=========2=========3=========4=========5=========6=========7=========8
+
+  subroutine update_incoming_rigidbody(rigidbody, domain)
+
+    ! formal arguments
+    type(s_rigidbody), target, intent(in)    :: rigidbody
+    type(s_domain),     target, intent(inout) :: domain
+
+    ! local variables
+    integer                     :: i, pb, jb, ib
+
+    integer,             pointer :: ncel_local
+    integer,             pointer :: num_rigidbody(:)
+    integer,             pointer :: rb_move(:), rb_stay(:)
+    integer,             pointer :: rb_move_int(:,:,:), rb_stay_int(:,:,:)
+    real(wip),           pointer :: rb_move_real(:,:,:), rb_stay_real(:,:,:)
+
+
+    ncel_local     => domain%num_cell_local
+    num_rigidbody  => domain%num_rigidbody
+    rb_move        => domain%rigidbody%move
+    rb_stay        => domain%rigidbody%stay
+    rb_move_real   => domain%rigidbody%move_real
+    rb_stay_real   => domain%rigidbody%stay_real
+    rb_move_int    => domain%rigidbody%move_integer
+    rb_stay_int    => domain%rigidbody%stay_integer
+
+    do i = 1, ncel_local
+
+      pb = 0
+
+      do jb = 1, rb_stay(i)
+        pb = pb + 1
+        ib = rb_stay_int(1,jb,i)
+        call unpack_rigidbody(rigidbody, domain, ib, pb, i, rb_stay_real(:,jb,i))
+      end do
+
+      do jb = 1, rb_move(i)
+        pb = pb + 1
+        ib = rb_move_int(1,jb,i)
+        call unpack_rigidbody(rigidbody, domain, ib, pb, i, rb_move_real(:,jb,i))
+      end do
+
+      num_rigidbody(i) = pb
+
+    end do
+
+    return
+
+  end subroutine update_incoming_rigidbody
+
+  !======1=========2=========3=========4=========5=========6=========7=========8
+  !
+  !  Subroutine    unpack_rigidbody
+  !> @brief        unpack one rigid body's migration buffer slot into fresh,
+  !!               freshly-appended local atom slots (domain%num_atom(icel)
+  !!               is advanced as each atom is placed) and its own per-cell
+  !!               runtime state; per-atom charge/mass/class/global-id are
+  !!               looked up from the static, replicated rigidbody structure
+  !!               rather than transmitted, since they never change
+  !! @authors      Genesis Developers
+  !
+  !======1=========2=========3=========4=========5=========6=========7=========8
+
+  subroutine unpack_rigidbody(rigidbody, domain, ib, pb, icel, buf)
+
+    ! formal arguments
+    type(s_rigidbody), intent(in)    :: rigidbody
+    type(s_domain),     intent(inout) :: domain
+    integer,            intent(in)    :: ib, pb, icel
+    real(wip),          intent(in)    :: buf(:)
+
+    ! local variables
+    integer                  :: k, ix, n, mn, gidx
+
+
+    n  = rigidbody%natom(ib)
+    mn = rigidbody%max_natom
+
+    domain%rigidbody_id(pb,icel) = ib
+
+    do k = 1, n
+
+      ix = domain%num_atom(icel) + 1
+
+      domain%coord(1,ix,icel)    = buf(6*(k-1)+1)
+      domain%coord(2,ix,icel)    = buf(6*(k-1)+2)
+      domain%coord(3,ix,icel)    = buf(6*(k-1)+3)
+      domain%velocity(1,ix,icel) = buf(6*(k-1)+4)
+      domain%velocity(2,ix,icel) = buf(6*(k-1)+5)
+      domain%velocity(3,ix,icel) = buf(6*(k-1)+6)
+
+      domain%charge(ix,icel)      = rigidbody%atom_charge(k,ib)
+      domain%mass  (ix,icel)      = rigidbody%atom_mass  (k,ib)
+      if (domain%mass(ix,icel) > EPS) &
+        domain%inv_mass(ix,icel)  = 1.0_wip / domain%mass(ix,icel)
+      domain%atom_cls_no(ix,icel) = rigidbody%atom_cls_no(k,ib)
+
+      gidx = rigidbody%atomlist(k,ib)
+      domain%id_l2g(ix,icel)   = gidx
+      domain%id_g2l(1,gidx)    = icel
+      domain%id_g2l(2,gidx)    = ix
+
+      domain%rigidbody_atom(k,pb,icel) = ix
+
+      domain%num_atom(icel) = ix
+
+    end do
+
+    domain%rigidbody_com     (1:3,pb,icel) = buf(6*mn+1:6*mn+3)
+    domain%rigidbody_vel_com (1:3,pb,icel) = buf(6*mn+4:6*mn+6)
+    domain%rigidbody_quat    (1:4,pb,icel) = buf(6*mn+7:6*mn+10)
+    domain%rigidbody_angmom  (1:3,pb,icel) = buf(6*mn+11:6*mn+13)
+
+    return
+
+  end subroutine unpack_rigidbody
 
   !======1=========2=========3=========4=========5=========6=========7=========8
   !

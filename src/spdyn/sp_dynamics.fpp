@@ -34,6 +34,7 @@ module sp_dynamics_mod
   use sp_enefunc_str_mod
   use sp_boundary_str_mod
   use sp_domain_str_mod
+  use rigidbody_str_mod
   use molecules_mod
   use molecules_str_mod
   use fileio_control_mod
@@ -793,7 +794,8 @@ contains
   !======1=========2=========3=========4=========5=========6=========7=========8
 
   subroutine run_md(output, domain, enefunc, dynvars, dynamics, &
-                    pairlist, boundary, constraints, ensemble, comm, remd)
+                    pairlist, boundary, constraints, ensemble, comm, remd, &
+                    rigidbody)
 
     ! formal arguments
     type(s_output),           intent(inout) :: output
@@ -807,6 +809,7 @@ contains
     type(s_ensemble),         intent(inout) :: ensemble
     type(s_comm),             intent(inout) :: comm
     type(s_remd),             intent(inout) :: remd
+    type(s_rigidbody), optional, intent(inout) :: rigidbody
 
 
     if (dynamics%target_md) then
@@ -839,9 +842,15 @@ contains
 
     case (IntegratorVRES)
 
-      call vverlet_respa_dynamics (output, domain, enefunc, dynvars, dynamics, &
-                             pairlist, boundary, constraints, ensemble, comm,  &
-                             remd)
+      if (present(rigidbody)) then
+        call vverlet_respa_dynamics (output, domain, enefunc, dynvars, dynamics, &
+                               pairlist, boundary, constraints, ensemble, comm,  &
+                               remd, rigidbody=rigidbody)
+      else
+        call vverlet_respa_dynamics (output, domain, enefunc, dynvars, dynamics, &
+                               pairlist, boundary, constraints, ensemble, comm,  &
+                               remd)
+      end if
 
     end select
 

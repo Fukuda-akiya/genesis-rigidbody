@@ -32,6 +32,8 @@ module sp_md_respa_mod
   use sp_pairlist_str_mod
   use sp_enefunc_str_mod
   use sp_domain_str_mod
+  use rigidbody_str_mod
+  use rigidbody_mod
   use random_mod
   use math_libs_mod
   use messages_mod
@@ -54,6 +56,10 @@ module sp_md_respa_mod
 
   ! subroutines
   public  :: vverlet_respa_dynamics
+  ! exposed for standalone testing (tests/rigid-body/test_rigidbody_dynamics.f90)
+  public  :: propagate_rigidbody_vv1
+  public  :: propagate_rigidbody_vv2
+  public  :: initialize_rigidbody_state
   private :: initial_vverlet
   private :: integrate_vv1
   private :: integrate_vv2
@@ -91,7 +97,7 @@ contains
   subroutine vverlet_respa_dynamics(output, domain, enefunc, dynvars, &
                                     dynamics, pairlist, boundary,     &
                                     constraints, ensemble, comm, remd,&
-                                    alchemy)
+                                    alchemy, rigidbody)
 
     use Ctim
 
@@ -108,6 +114,7 @@ contains
     type(s_comm),              intent(inout) :: comm
     type(s_remd),              intent(inout) :: remd
     type(s_alchemy), optional, intent(inout) :: alchemy
+    type(s_rigidbody), optional, intent(inout) :: rigidbody
 
     ! local variables
     real(wip)                :: simtim, temperature
@@ -234,7 +241,11 @@ contains
         end if
 
       end if
-    
+
+    end if
+
+    if (present(rigidbody)) then
+      if (rigidbody%is_used) call initialize_rigidbody_state(rigidbody, domain)
     end if
 
     call mpi_barrier(mpi_comm_country, ierror)
@@ -289,8 +300,14 @@ contains
 
         ! VV1
         !
-        call integrate_vv1(dynamics, istep, istart, j, dt_long, dt_short,  &
-                           ensemble, domain, constraints, boundary, dynvars)
+        if (present(rigidbody)) then
+          call integrate_vv1(dynamics, istep, istart, j, dt_long, dt_short,  &
+                             ensemble, domain, constraints, boundary, dynvars, &
+                             rigidbody)
+        else
+          call integrate_vv1(dynamics, istep, istart, j, dt_long, dt_short,  &
+                             ensemble, domain, constraints, boundary, dynvars)
+        end if
 
         call timer(TimerIntegrator, TimerOff)
 
@@ -324,6 +341,10 @@ contains
             call domain_interaction_update_fep(istep, dynamics%nbupdate_period, &
                                          domain, enefunc, pairlist, boundary, &
                                          constraints, comm)
+          else if (present(rigidbody)) then
+            call domain_interaction_update(istep, dynamics%nbupdate_period,     &
+                                         domain, enefunc, pairlist, boundary, &
+                                         constraints, comm, rigidbody=rigidbody)
           else
             call domain_interaction_update(istep, dynamics%nbupdate_period,     &
                                          domain, enefunc, pairlist, boundary, &
@@ -422,8 +443,13 @@ contains
 
         ! VV2
         !
-        call integrate_vv2(dynamics, istep, j, dt_long, dt_short, ensemble,    &
-                           domain, constraints, boundary, dynvars)
+        if (present(rigidbody)) then
+          call integrate_vv2(dynamics, istep, j, dt_long, dt_short, ensemble,    &
+                             domain, constraints, boundary, dynvars, rigidbody)
+        else
+          call integrate_vv2(dynamics, istep, j, dt_long, dt_short, ensemble,    &
+                             domain, constraints, boundary, dynvars)
+        end if
 
       end do
 
@@ -453,8 +479,13 @@ contains
       end if
     end if
 
-    call integrate_vv1(dynamics, iend+1, istart, 1, dt_long, dt_short, ensemble, &
-                       domain, constraints, boundary, dynvars)
+    if (present(rigidbody)) then
+      call integrate_vv1(dynamics, iend+1, istart, 1, dt_long, dt_short, ensemble, &
+                         domain, constraints, boundary, dynvars, rigidbody)
+    else
+      call integrate_vv1(dynamics, iend+1, istart, 1, dt_long, dt_short, ensemble, &
+                         domain, constraints, boundary, dynvars)
+    end if
 
     call coord_vel_ref(domain, dynvars)
     if (ensemble%tpcontrol == TpcontrolNHC) &
@@ -710,7 +741,7 @@ contains
 
   subroutine integrate_vv1(dynamics, istep, istart, inner_step, dt_long, &
                            dt_short, ensemble, domain, constraints, boundary, &
-                           dynvars)
+                           dynvars, rigidbody)
 
     ! formal arguments
     type(s_dynamics),        intent(in)    :: dynamics
@@ -724,6 +755,7 @@ contains
     type(s_constraints),     intent(inout) :: constraints
     type(s_boundary),        intent(inout) :: boundary
     type(s_dynvars),         intent(inout) :: dynvars
+    type(s_rigidbody), optional, intent(in) :: rigidbody
 
     integer  :: alloc_stat, ncell
     real(wip):: dt_therm, dt_baro
@@ -734,12 +766,25 @@ contains
     if (.not. ensemble%group_tp .and. constraints%rigid_bond) &
       call error_msg('In VRES, ensemble%group_tp=NO does not work')
 
+    if (present(rigidbody)) then
+      if (rigidbody%is_used .and. ensemble%ensemble /= EnsembleNVE) &
+        call error_msg('Integrate_VV1> [RIGIDBODY] currently supports '// &
+                        'only ensemble = NVE in the RESPA (VRES) '//      &
+                        'integrator; NVT/NPT support is not yet '//       &
+                        'implemented (see tests/rigid-body/SPEC.md)')
+    end if
+
     select case (ensemble%ensemble)
 
     case (EnsembleNVE)
 
-      call nve_vv1(dynamics, istep, dt_long, dt_short, domain, constraints, &
-                   dynvars)
+      if (present(rigidbody)) then
+        call nve_vv1(dynamics, istep, dt_long, dt_short, domain, constraints, &
+                     dynvars, rigidbody)
+      else
+        call nve_vv1(dynamics, istep, dt_long, dt_short, domain, constraints, &
+                     dynvars)
+      end if
 
     case (EnsembleNVT)
 
@@ -803,19 +848,21 @@ contains
   !======1=========2=========3=========4=========5=========6=========7=========8
 
   subroutine integrate_vv2(dynamics, istep, inner_step, dt_long, dt_short,  &
-                           ensemble, domain, constraints, boundary, dynvars)
+                           ensemble, domain, constraints, boundary, dynvars, &
+                           rigidbody)
 
     ! formal arguments
     type(s_dynamics),        intent(in)    :: dynamics
     integer,                 intent(in)    :: istep
     integer,                 intent(in)    :: inner_step
-    real(wip),               intent(in)    :: dt_long 
+    real(wip),               intent(in)    :: dt_long
     real(wip),               intent(in)    :: dt_short
     type(s_ensemble),        intent(inout) :: ensemble
     type(s_domain),          intent(inout) :: domain
     type(s_constraints),     intent(inout) :: constraints
     type(s_boundary),        intent(inout) :: boundary
     type(s_dynvars),         intent(inout) :: dynvars
+    type(s_rigidbody), optional, intent(in) :: rigidbody
 
     real(wip):: dt_therm
 
@@ -826,8 +873,13 @@ contains
 
     case (EnsembleNVE)
 
-      call nve_vv2(dynamics, inner_step, dt_long, dt_short, domain, &
-                   constraints, dynvars)
+      if (present(rigidbody)) then
+        call nve_vv2(dynamics, inner_step, dt_long, dt_short, domain, &
+                     constraints, dynvars, rigidbody)
+      else
+        call nve_vv2(dynamics, inner_step, dt_long, dt_short, domain, &
+                     constraints, dynvars)
+      end if
 
     case (EnsembleNVT)
 
@@ -876,6 +928,361 @@ contains
     return
 
   end subroutine integrate_vv2
+
+  !======1=========2=========3=========4=========5=========6=========7=========8
+  !
+  !  Subroutine    write_rigidbody_atoms
+  !> @brief        recompute one rigid body's member-atom velocities (and,
+  !!               optionally, coordinates) from its current per-cell
+  !!               runtime state (com, vel_com, quat, angmom), overwriting
+  !!               whatever the naive point-particle kick/drift already
+  !!               wrote for those atoms -- the same "compute unconstrained
+  !!               update, then overwrite with the analytic solution"
+  !!               pattern SETTLE uses for rigid water
+  !! @authors      Genesis Developers
+  !! @param[in]    rigidbody    : rigid-body information (global, replicated)
+  !! @param[in]    ib           : global body index
+  !! @param[inout] domain       : domain information
+  !! @param[in]    pb           : per-cell body slot
+  !! @param[in]    icel         : local cell index
+  !! @param[in]    update_coord : also recompute coordinates (true in VV1
+  !!                              and at initialization; false in VV2,
+  !!                              where only velocities are refreshed)
+  !
+  !======1=========2=========3=========4=========5=========6=========7=========8
+
+  subroutine write_rigidbody_atoms(rigidbody, ib, domain, pb, icel, update_coord)
+
+    ! formal arguments
+    type(s_rigidbody), intent(in)    :: rigidbody
+    integer,            intent(in)    :: ib
+    type(s_domain),     intent(inout) :: domain
+    integer,            intent(in)    :: pb, icel
+    logical,            intent(in)    :: update_coord
+
+    ! local variables
+    integer                  :: k, ix, n
+    real(wp)                 :: q(4), rotmat(3,3), omega_space(3), r(3)
+
+
+    n = rigidbody%natom(ib)
+    q(1:4) = domain%rigidbody_quat(1:4,pb,icel)
+
+    call rigidbody_angvel(q, domain%rigidbody_angmom(1:3,pb,icel), &
+                          rigidbody%inv_inertia(1:3,ib), omega_space, rotmat)
+
+    do k = 1, n
+
+      ix = domain%rigidbody_atom(k,pb,icel)
+
+      if (update_coord) then
+        r(1:3) = rotmat(1:3,1)*rigidbody%ref_coord(1,k,ib) &
+               + rotmat(1:3,2)*rigidbody%ref_coord(2,k,ib) &
+               + rotmat(1:3,3)*rigidbody%ref_coord(3,k,ib)
+        domain%coord(1:3,ix,icel) = domain%rigidbody_com(1:3,pb,icel) + r(1:3)
+      else
+        r(1:3) = domain%coord(1:3,ix,icel) - domain%rigidbody_com(1:3,pb,icel)
+      end if
+
+      domain%velocity(1,ix,icel) = domain%rigidbody_vel_com(1,pb,icel) &
+                                  + omega_space(2)*r(3) - omega_space(3)*r(2)
+      domain%velocity(2,ix,icel) = domain%rigidbody_vel_com(2,pb,icel) &
+                                  + omega_space(3)*r(1) - omega_space(1)*r(3)
+      domain%velocity(3,ix,icel) = domain%rigidbody_vel_com(3,pb,icel) &
+                                  + omega_space(1)*r(2) - omega_space(2)*r(1)
+
+    end do
+
+    return
+
+  end subroutine write_rigidbody_atoms
+
+  !======1=========2=========3=========4=========5=========6=========7=========8
+  !
+  !  Subroutine    rigidbody_force_torque
+  !> @brief        net force and torque (about the body's current COM) from
+  !!               one force array (force_short or force_long), summed over
+  !!               a rigid body's member atoms
+  !! @authors      Genesis Developers
+  !
+  !======1=========2=========3=========4=========5=========6=========7=========8
+
+  subroutine rigidbody_force_torque(rigidbody, ib, domain, pb, icel, force, &
+                                    force_net, torque_net)
+
+    ! formal arguments
+    type(s_rigidbody), intent(in)  :: rigidbody
+    integer,            intent(in)  :: ib
+    type(s_domain),     intent(in)  :: domain
+    integer,            intent(in)  :: pb, icel
+    real(wip),          intent(in)  :: force(:,:,:)
+    real(wp),           intent(out) :: force_net(3), torque_net(3)
+
+    ! local variables
+    integer                  :: k, ix, n
+    real(wp)                 :: r(3), f(3)
+
+
+    n = rigidbody%natom(ib)
+    force_net(1:3)  = 0.0_wp
+    torque_net(1:3) = 0.0_wp
+
+    do k = 1, n
+      ix = domain%rigidbody_atom(k,pb,icel)
+      f(1:3) = real(force(1:3,ix,icel),wp)
+      r(1:3) = real(domain%coord(1:3,ix,icel),wp) &
+             - real(domain%rigidbody_com(1:3,pb,icel),wp)
+
+      force_net(1:3)  = force_net(1:3) + f(1:3)
+      torque_net(1)   = torque_net(1)  + r(2)*f(3) - r(3)*f(2)
+      torque_net(2)   = torque_net(2)  + r(3)*f(1) - r(1)*f(3)
+      torque_net(3)   = torque_net(3)  + r(1)*f(2) - r(2)*f(1)
+    end do
+
+    return
+
+  end subroutine rigidbody_force_torque
+
+  !======1=========2=========3=========4=========5=========6=========7=========8
+  !
+  !  Subroutine    propagate_rigidbody_vv1
+  !> @brief        RESPA inner-loop VV1 half-step for all rigid bodies local
+  !!               to this rank: half-kick (force_short every inner step,
+  !!               force_long only at the first inner step of the outer
+  !!               block, mirroring nve_vv1's point-particle treatment),
+  !!               then drift the center of mass and orientation quaternion
+  !!               by dt_short, then write the result back into the
+  !!               member atoms' coord/velocity
+  !! @authors      Genesis Developers
+  !! @param[in]    rigidbody         : rigid-body information
+  !! @param[inout] domain            : domain information
+  !! @param[in]    istep             : dynamics step
+  !! @param[in]    elec_long_period  : outer-loop period (multistep)
+  !! @param[in]    dt_long           : outer loop time step
+  !! @param[in]    dt_short          : inner loop time step
+  !
+  !======1=========2=========3=========4=========5=========6=========7=========8
+
+  subroutine propagate_rigidbody_vv1(rigidbody, domain, istep, &
+                                     elec_long_period, dt_long, dt_short)
+
+    ! formal arguments
+    type(s_rigidbody), intent(in)    :: rigidbody
+    type(s_domain),     intent(inout) :: domain
+    integer,            intent(in)    :: istep, elec_long_period
+    real(wip),          intent(in)    :: dt_long, dt_short
+
+    ! local variables
+    integer                  :: i, pb, ib
+    real(wp)                 :: half_dt_long, half_dt_short
+    real(wp)                 :: force_net(3), torque_net(3)
+    real(wp)                 :: q(4), qn(4)
+    real(wp)                 :: omega_space(3), omega_body(3), rotmat(3,3)
+    logical                  :: apply_long
+
+
+    half_dt_long  = 0.5_wp * real(dt_long,wp)
+    half_dt_short = 0.5_wp * real(dt_short,wp)
+    apply_long    = (mod(istep-1, elec_long_period) == 0)
+
+    do i = 1, domain%num_cell_local
+      do pb = 1, domain%num_rigidbody(i)
+
+        ib = domain%rigidbody_id(pb,i)
+
+        ! half-kick with the short-range force (every inner step)
+        call rigidbody_force_torque(rigidbody, ib, domain, pb, i, &
+                                    domain%force_short, force_net, torque_net)
+        domain%rigidbody_vel_com(1:3,pb,i) = domain%rigidbody_vel_com(1:3,pb,i) &
+                        + half_dt_short * rigidbody%inv_mass(ib) * force_net(1:3)
+        domain%rigidbody_angmom(1:3,pb,i)  = domain%rigidbody_angmom(1:3,pb,i) &
+                        + half_dt_short * torque_net(1:3)
+
+        ! half-kick with the long-range force (only at the outer-block
+        ! boundary, mirroring the point-particle nve_vv1 split)
+        if (apply_long) then
+          call rigidbody_force_torque(rigidbody, ib, domain, pb, i, &
+                                      domain%force_long, force_net, torque_net)
+          domain%rigidbody_vel_com(1:3,pb,i) = domain%rigidbody_vel_com(1:3,pb,i) &
+                          + half_dt_long * rigidbody%inv_mass(ib) * force_net(1:3)
+          domain%rigidbody_angmom(1:3,pb,i)  = domain%rigidbody_angmom(1:3,pb,i) &
+                          + half_dt_long * torque_net(1:3)
+        end if
+
+        ! drift: translate the center of mass
+        domain%rigidbody_com(1:3,pb,i) = domain%rigidbody_com(1:3,pb,i) &
+                        + real(dt_short,wp) * domain%rigidbody_vel_com(1:3,pb,i)
+
+        ! drift: rotate the orientation quaternion by the exponential map
+        ! of the body-frame angular velocity (a geometric SO(3) integrator;
+        ! far better long-term energy behavior than a linearized quaternion
+        ! derivative step, see quat_rotate_by_body_omega)
+        q(1:4) = domain%rigidbody_quat(1:4,pb,i)
+        call rigidbody_angvel(q, domain%rigidbody_angmom(1:3,pb,i), &
+                              rigidbody%inv_inertia(1:3,ib), omega_space, &
+                              rotmat, omega_body)
+        qn(1:4) = quat_rotate_by_body_omega(q, omega_body, real(dt_short,wp))
+        domain%rigidbody_quat(1:4,pb,i) = qn(1:4)
+
+        ! write the new coordinates and velocities back to the member atoms
+        call write_rigidbody_atoms(rigidbody, ib, domain, pb, i, .true.)
+
+      end do
+    end do
+
+    return
+
+  end subroutine propagate_rigidbody_vv1
+
+  !======1=========2=========3=========4=========5=========6=========7=========8
+  !
+  !  Subroutine    propagate_rigidbody_vv2
+  !> @brief        RESPA inner-loop VV2 half-step for all rigid bodies local
+  !!               to this rank: half-kick only (no drift, mirroring the
+  !!               point-particle nve_vv2), then refresh member-atom
+  !!               velocities (coordinates are unchanged in VV2)
+  !! @authors      Genesis Developers
+  !! @param[in]    rigidbody         : rigid-body information
+  !! @param[inout] domain            : domain information
+  !! @param[in]    inner_step        : inner step (1..elec_long_period)
+  !! @param[in]    elec_long_period  : outer-loop period (multistep)
+  !! @param[in]    dt_long           : outer loop time step
+  !! @param[in]    dt_short          : inner loop time step
+  !
+  !======1=========2=========3=========4=========5=========6=========7=========8
+
+  subroutine propagate_rigidbody_vv2(rigidbody, domain, inner_step, &
+                                     elec_long_period, dt_long, dt_short)
+
+    ! formal arguments
+    type(s_rigidbody), intent(in)    :: rigidbody
+    type(s_domain),     intent(inout) :: domain
+    integer,            intent(in)    :: inner_step, elec_long_period
+    real(wip),          intent(in)    :: dt_long, dt_short
+
+    ! local variables
+    integer                  :: i, pb, ib
+    real(wp)                 :: half_dt_long, half_dt_short
+    real(wp)                 :: force_net(3), torque_net(3)
+
+
+    half_dt_long  = 0.5_wp * real(dt_long,wp)
+    half_dt_short = 0.5_wp * real(dt_short,wp)
+
+    do i = 1, domain%num_cell_local
+      do pb = 1, domain%num_rigidbody(i)
+
+        ib = domain%rigidbody_id(pb,i)
+
+        call rigidbody_force_torque(rigidbody, ib, domain, pb, i, &
+                                    domain%force_short, force_net, torque_net)
+        domain%rigidbody_vel_com(1:3,pb,i) = domain%rigidbody_vel_com(1:3,pb,i) &
+                        + half_dt_short * rigidbody%inv_mass(ib) * force_net(1:3)
+        domain%rigidbody_angmom(1:3,pb,i)  = domain%rigidbody_angmom(1:3,pb,i) &
+                        + half_dt_short * torque_net(1:3)
+
+        if (inner_step == elec_long_period) then
+          call rigidbody_force_torque(rigidbody, ib, domain, pb, i, &
+                                      domain%force_long, force_net, torque_net)
+          domain%rigidbody_vel_com(1:3,pb,i) = domain%rigidbody_vel_com(1:3,pb,i) &
+                          + half_dt_long * rigidbody%inv_mass(ib) * force_net(1:3)
+          domain%rigidbody_angmom(1:3,pb,i)  = domain%rigidbody_angmom(1:3,pb,i) &
+                          + half_dt_long * torque_net(1:3)
+        end if
+
+        call write_rigidbody_atoms(rigidbody, ib, domain, pb, i, .false.)
+
+      end do
+    end do
+
+    return
+
+  end subroutine propagate_rigidbody_vv2
+
+  !======1=========2=========3=========4=========5=========6=========7=========8
+  !
+  !  Subroutine    initialize_rigidbody_state
+  !> @brief        initialize every local rigid body's runtime state (COM,
+  !!               COM velocity, orientation quaternion, angular momentum)
+  !!               from the actual starting per-atom coordinates and
+  !!               velocities; called once before the main RESPA loop
+  !!               starts. The orientation is found by fitting the
+  !!               body-fixed reference geometry onto the current atom
+  !!               positions (fit_rigidbody_quat); member-atom coordinates
+  !!               are then snapped exactly onto that fit, which removes
+  !!               any small inconsistency between the input structure and
+  !!               the given rigid-body reference geometry.
+  !! @authors      Genesis Developers
+  !
+  !======1=========2=========3=========4=========5=========6=========7=========8
+
+  subroutine initialize_rigidbody_state(rigidbody, domain)
+
+    ! formal arguments
+    type(s_rigidbody), intent(in)    :: rigidbody
+    type(s_domain),     intent(inout) :: domain
+
+    ! local variables
+    integer                  :: i, pb, ib, k, ix, n, ierr
+    real(wp)                 :: com(3), vel_com(3), angmom(3), r(3), v(3)
+    real(wp)                 :: quat(4)
+    real(wp)                 :: movcoord(3,rigidbody%max_natom)
+    real(wp)                 :: massbuf(rigidbody%max_natom)
+
+
+    do i = 1, domain%num_cell_local
+      do pb = 1, domain%num_rigidbody(i)
+
+        ib = domain%rigidbody_id(pb,i)
+        n  = rigidbody%natom(ib)
+
+        com(1:3)     = 0.0_wp
+        vel_com(1:3) = 0.0_wp
+
+        do k = 1, n
+          ix = domain%rigidbody_atom(k,pb,i)
+          com(1:3)     = com(1:3)     &
+                        + rigidbody%atom_mass(k,ib)*real(domain%coord(1:3,ix,i),wp)
+          vel_com(1:3) = vel_com(1:3) &
+                        + rigidbody%atom_mass(k,ib)*real(domain%velocity(1:3,ix,i),wp)
+          movcoord(1:3,k) = real(domain%coord(1:3,ix,i),wp)
+          massbuf(k)      = rigidbody%atom_mass(k,ib)
+        end do
+
+        com(1:3)     = com(1:3)     * rigidbody%inv_mass(ib)
+        vel_com(1:3) = vel_com(1:3) * rigidbody%inv_mass(ib)
+
+        call fit_rigidbody_quat(n, rigidbody%ref_coord(1:3,1:n,ib), &
+                                movcoord(1:3,1:n), massbuf(1:n), quat, ierr)
+        if (ierr /= 0) &
+          call error_msg('Initialize_Rigidbody_State> failed to fit the '// &
+                          'initial orientation of a rigid body -- check '// &
+                          'that the starting structure is consistent with '// &
+                          'the [RIGIDBODY] reference geometry')
+
+        angmom(1:3) = 0.0_wp
+        do k = 1, n
+          ix = domain%rigidbody_atom(k,pb,i)
+          r(1:3) = real(domain%coord(1:3,ix,i),wp) - com(1:3)
+          v(1:3) = real(domain%velocity(1:3,ix,i),wp) - vel_com(1:3)
+          angmom(1) = angmom(1) + rigidbody%atom_mass(k,ib)*(r(2)*v(3)-r(3)*v(2))
+          angmom(2) = angmom(2) + rigidbody%atom_mass(k,ib)*(r(3)*v(1)-r(1)*v(3))
+          angmom(3) = angmom(3) + rigidbody%atom_mass(k,ib)*(r(1)*v(2)-r(2)*v(1))
+        end do
+
+        domain%rigidbody_com(1:3,pb,i)     = real(com(1:3),wip)
+        domain%rigidbody_vel_com(1:3,pb,i) = real(vel_com(1:3),wip)
+        domain%rigidbody_quat(1:4,pb,i)    = real(quat(1:4),wip)
+        domain%rigidbody_angmom(1:3,pb,i)  = real(angmom(1:3),wip)
+
+        call write_rigidbody_atoms(rigidbody, ib, domain, pb, i, .true.)
+
+      end do
+    end do
+
+    return
+
+  end subroutine initialize_rigidbody_state
 
   !======1=========2=========3=========4=========5=========6=========7=========8
   !
@@ -945,7 +1352,7 @@ contains
   !======1=========2=========3=========4=========5=========6=========7=========8
 
   subroutine nve_vv1(dynamics, istep, dt_long, dt_short, domain, constraints, &
-                     dynvars)
+                     dynvars, rigidbody)
 
     ! formal arguments
     type(s_dynamics),        intent(in)    :: dynamics
@@ -955,6 +1362,7 @@ contains
     type(s_domain),  target, intent(inout) :: domain
     type(s_constraints),     intent(inout) :: constraints
     type(s_dynvars), target, intent(inout) :: dynvars
+    type(s_rigidbody), optional, intent(in) :: rigidbody
 
     ! local variables
     integer                  :: i, ix, k, l
@@ -1083,6 +1491,17 @@ contains
                                vel, viri_const)
     end if
 
+    ! rigid-body VV1 (overwrites the naive per-atom update above for
+    ! rigid-body member atoms, the same way RATTLE overwrites it for
+    ! constrained bonds)
+    !
+    if (present(rigidbody)) then
+      if (rigidbody%is_used) &
+        call propagate_rigidbody_vv1(rigidbody, domain, istep, &
+                                     dynamics%elec_long_period, &
+                                     dt_long, dt_short)
+    end if
+
     return
 
   end subroutine nve_vv1
@@ -1103,7 +1522,7 @@ contains
   !======1=========2=========3=========4=========5=========6=========7=========8
 
   subroutine nve_vv2(dynamics, inner_step, dt_long, dt_short, domain, &
-                     constraints, dynvars)
+                     constraints, dynvars, rigidbody)
 
     ! formal arguments
     type(s_dynamics),        intent(in)    :: dynamics
@@ -1113,6 +1532,7 @@ contains
     type(s_domain),  target, intent(inout) :: domain
     type(s_constraints),     intent(inout) :: constraints
     type(s_dynvars), target, intent(inout) :: dynvars
+    type(s_rigidbody), optional, intent(in) :: rigidbody
 
     ! local variables
     integer                  :: i, ix, k, l, ncell
@@ -1184,6 +1604,15 @@ contains
       call compute_constraints(ConstraintModeVVER2, .false., dt_short, &
                                coord_ref, domain, constraints, coord,  &
                                vel, viri_const)
+    end if
+
+    ! rigid-body VV2
+    !
+    if (present(rigidbody)) then
+      if (rigidbody%is_used) &
+        call propagate_rigidbody_vv2(rigidbody, domain, inner_step, &
+                                     dynamics%elec_long_period, &
+                                     dt_long, dt_short)
     end if
 
     return

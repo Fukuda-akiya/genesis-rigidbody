@@ -36,9 +36,35 @@ module sp_domain_str_mod
 
   end type s_domain_water
 
+  ! domain-local (per-cell) rigid-body bookkeeping and runtime state.
+  ! The immutable per-body physics (mass, inertia, body-fixed reference
+  ! geometry) lives in the replicated, global s_rigidbody (rigidbody_str_mod)
+  ! and is looked up here by global body index (rigidbody_id).
+  type, public :: s_domain_rigidbody
+
+    integer,          allocatable :: move(:)
+    integer,          allocatable :: stay(:)
+    integer,          allocatable :: move_integer(:,:,:)   ! (1,MaxRigidBodyMove,ncell): global body id
+    integer,          allocatable :: stay_integer(:,:,:)   ! (1,MaxRigidBody,ncell)    : global body id
+    real(wip),        allocatable :: move_real(:,:,:)      ! (6*max_natom+13,MaxRigidBodyMove,ncell)
+    real(wip),        allocatable :: stay_real(:,:,:)      ! (6*max_natom+13,MaxRigidBody,ncell)
+
+  end type s_domain_rigidbody
+
   type, public :: s_domain
 
     type(s_domain_water)          :: water
+    type(s_domain_rigidbody)      :: rigidbody
+
+    ! per-cell rigid-body bookkeeping (see s_domain_rigidbody above for the
+    ! migration staging buffers)
+    integer,          allocatable :: num_rigidbody(:)      ! (ncell)
+    integer,          allocatable :: rigidbody_id(:,:)     ! (MaxRigidBody,ncell) global body index
+    integer,          allocatable :: rigidbody_atom(:,:,:) ! (max_natom,MaxRigidBody,ncell) local atom slot
+    real(wip),        allocatable :: rigidbody_com(:,:,:)      ! (3,MaxRigidBody,ncell)
+    real(wip),        allocatable :: rigidbody_vel_com(:,:,:)  ! (3,MaxRigidBody,ncell)
+    real(wip),        allocatable :: rigidbody_quat(:,:,:)     ! (4,MaxRigidBody,ncell)
+    real(wip),        allocatable :: rigidbody_angmom(:,:,:)   ! (3,MaxRigidBody,ncell)
 
     integer(iintegers)            :: num_atom_all
     integer(iintegers)            :: num_deg_freedom
@@ -277,12 +303,17 @@ module sp_domain_str_mod
   integer,      public, parameter :: DomainPtlMove_FEP      = 18
   integer,      public, parameter :: DomainWaterMove_FEP    = 19
   integer,      public, parameter :: DomainAlchemyMove_FEP  = 20
+  integer,      public, parameter :: DomainRigidBody        = 21
+  integer,      public, parameter :: DomainRigidBodyMove    = 22
 
   ! variables for maximum numbers in one cell
   integer,      public            :: MaxAtom                = 150
   integer,      public            :: MaxWater               = 50
   integer,      public            :: MaxMove                = 30
   integer,      public            :: MaxWaterMove           = 20
+  integer,      public            :: MaxRigidBody           = 1
+  integer,      public            :: MaxRigidBodyMove       = 1
+  integer,      public            :: MaxRigidBodyAtom       = 1
   real(wp),     public            :: inv_MaxAtom
 
   ! variables for maximum cells
@@ -1031,6 +1062,70 @@ contains
       domain%water%stay_integer(1:2*var_size2, 1:MaxWater, 1:var_size1)     = 0
       domain%water%move_real(1:6*var_size2,1:MaxWaterMove,1:var_size) = 0.0_wip
       domain%water%stay_real(1:6*var_size2,1:MaxWater,1:var_size1)    = 0.0_wip
+
+    case (DomainRigidBody)
+
+      ! var_size = ncel_all, var_size1 = max_natom (rigidbody%max_natom)
+      if (allocated(domain%num_rigidbody)) then
+        if (size(domain%num_rigidbody) /= var_size) &
+          deallocate(domain%num_rigidbody,     &
+                     domain%rigidbody_id,      &
+                     domain%rigidbody_atom,    &
+                     domain%rigidbody_com,     &
+                     domain%rigidbody_vel_com, &
+                     domain%rigidbody_quat,    &
+                     domain%rigidbody_angmom,  &
+                     stat = dealloc_stat)
+      end if
+
+      if (.not. allocated(domain%num_rigidbody)) &
+        allocate(domain%num_rigidbody     (var_size),                          &
+                 domain%rigidbody_id      (MaxRigidBody, var_size),            &
+                 domain%rigidbody_atom    (var_size1, MaxRigidBody, var_size), &
+                 domain%rigidbody_com     (3, MaxRigidBody, var_size),         &
+                 domain%rigidbody_vel_com (3, MaxRigidBody, var_size),         &
+                 domain%rigidbody_quat    (4, MaxRigidBody, var_size),         &
+                 domain%rigidbody_angmom  (3, MaxRigidBody, var_size),         &
+                 stat = alloc_stat)
+
+      domain%num_rigidbody    (1:var_size)                             = 0
+      domain%rigidbody_id     (1:MaxRigidBody, 1:var_size)              = 0
+      domain%rigidbody_atom   (1:var_size1, 1:MaxRigidBody, 1:var_size) = 0
+      domain%rigidbody_com    (1:3, 1:MaxRigidBody, 1:var_size)         = 0.0_wip
+      domain%rigidbody_vel_com(1:3, 1:MaxRigidBody, 1:var_size)         = 0.0_wip
+      domain%rigidbody_quat   (1:4, 1:MaxRigidBody, 1:var_size)         = 0.0_wip
+      domain%rigidbody_quat   (1, 1:MaxRigidBody, 1:var_size)           = 1.0_wip
+      domain%rigidbody_angmom (1:3, 1:MaxRigidBody, 1:var_size)         = 0.0_wip
+
+    case (DomainRigidBodyMove)
+
+      ! var_size = ncel_all, var_size1 = ncel_local, var_size2 = max_natom
+      if (allocated(domain%rigidbody%move)) then
+        if (size(domain%rigidbody%move(:)) /= var_size) &
+          deallocate(domain%rigidbody%move,         &
+                     domain%rigidbody%stay,         &
+                     domain%rigidbody%move_integer, &
+                     domain%rigidbody%stay_integer, &
+                     domain%rigidbody%move_real,    &
+                     domain%rigidbody%stay_real,    &
+                     stat = dealloc_stat)
+      end if
+
+      if (.not. allocated(domain%rigidbody%move)) &
+        allocate(domain%rigidbody%move        (var_size),                        &
+                 domain%rigidbody%stay        (var_size1),                       &
+                 domain%rigidbody%move_integer(1, MaxRigidBodyMove, var_size),   &
+                 domain%rigidbody%stay_integer(1, MaxRigidBody, var_size1),      &
+                 domain%rigidbody%move_real(6*var_size2+13, MaxRigidBodyMove, var_size), &
+                 domain%rigidbody%stay_real(6*var_size2+13, MaxRigidBody, var_size1),    &
+                 stat = alloc_stat)
+
+      domain%rigidbody%move        (1:var_size)                    = 0
+      domain%rigidbody%stay        (1:var_size1)                   = 0
+      domain%rigidbody%move_integer(1, 1:MaxRigidBodyMove, 1:var_size) = 0
+      domain%rigidbody%stay_integer(1, 1:MaxRigidBody, 1:var_size1)    = 0
+      domain%rigidbody%move_real(1:6*var_size2+13,1:MaxRigidBodyMove,1:var_size) = 0.0_wip
+      domain%rigidbody%stay_real(1:6*var_size2+13,1:MaxRigidBody,1:var_size1)    = 0.0_wip
 
     case default
 

@@ -22,6 +22,8 @@ module sp_setup_spdyn_mod
   use sp_dynamics_mod
   use sp_dynvars_mod
   use sp_domain_mod
+  use sp_rigidbody_mod
+  use rigidbody_str_mod
   use sp_ensemble_mod
   use sp_enefunc_table_mod
   use sp_restraints_mod
@@ -118,7 +120,7 @@ contains
 
   subroutine setup_spdyn_md(ctrl_data, output, molecule, enefunc, pairlist,    &
                            dynvars, dynamics, constraints, ensemble, boundary, &
-                           domain, comm, alchemy)
+                           domain, comm, alchemy, rigidbody)
 
     ! formal arguments
     type(s_ctrl_data),       intent(inout) :: ctrl_data
@@ -134,6 +136,7 @@ contains
     type(s_domain),          intent(inout) :: domain
     type(s_comm),            intent(inout) :: comm
     type(s_alchemy),optional,intent(inout) :: alchemy
+    type(s_rigidbody), optional, intent(inout) :: rigidbody
 
     ! local variables
     type(s_restraints)       :: restraints
@@ -214,14 +217,26 @@ contains
                         ctrl_data%ene_info%dsize_cg,     &
                         ctrl_data%ene_info%dmin_size_cg, &
                         rst, boundary)
-  
-    ! set parameters for domain 
+
+    ! set parameters for rigid-body dynamics (no-op unless [RIGIDBODY] is
+    ! given in the control file)
+    !
+    if (present(rigidbody)) &
+      call setup_rigidbody_spdyn(ctrl_data%rgbd_info, molecule, boundary, &
+                                 rigidbody)
+
+    ! set parameters for domain
     !
     if (present(alchemy)) then
       ! FEP
       call setup_domain_fep(ctrl_data%ene_info,  &
                       ctrl_data%cons_info, &
                       boundary, molecule, enefunc, constraints, domain)
+    else if (present(rigidbody)) then
+      call setup_domain(ctrl_data%ene_info,  &
+                        ctrl_data%cons_info, &
+                        boundary, molecule, enefunc, constraints, domain, &
+                        rigidbody)
     else
       call setup_domain(ctrl_data%ene_info,  &
                         ctrl_data%cons_info, &
@@ -329,6 +344,17 @@ contains
         &of singleB in FEP',    &
         -3*molecule%num_atoms_fep(2), &
         molecule%num_deg_freedom)
+    end if
+
+    if (present(rigidbody)) then
+      if (rigidbody%is_used) then
+        ! each rigid body's atoms go from 3*natom translational+internal
+        ! degrees of freedom to 6 (3 translation + 3 rotation)
+        call update_num_deg_freedom('After replacing [RIGIDBODY] atom '// &
+          'degrees of freedom with 6 per body', &
+          6*rigidbody%num_bodies - 3*sum(rigidbody%natom(1:rigidbody%num_bodies)), &
+          molecule%num_deg_freedom)
+      end if
     end if
 
     call dealloc_molecules_all(molecule)

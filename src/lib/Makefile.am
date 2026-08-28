@@ -68,6 +68,7 @@ lib_a_SOURCES = \
 	fileio_morph.fpp \
 	fileio_table.fpp \
 	fileio_spot.fpp \
+	fileio_rigidbody.fpp \
 	hardwareinfo.fpp \
 	dSFMT/dSFMT.c \
 	dSFMT/dSFMT_if.c \
@@ -88,7 +89,9 @@ lib_a_SOURCES = \
 	molecules_str.fpp \
 	select_atoms_str.fpp \
 	fitting_str.fpp \
+	rigidbody_str.fpp \
 	molecules.fpp \
+	rigidbody.fpp \
 	dihedral_libs.fpp \
 	select_lexer.fpp \
 	select_parser.fpp \

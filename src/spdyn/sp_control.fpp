@@ -28,6 +28,7 @@ module sp_control_mod
   use sp_rpath_mod
   use sp_experiments_mod
   use sp_gamd_mod
+  use sp_rigidbody_mod
   use select_mod
   use fitting_mod
   use fileio_control_mod
@@ -93,6 +94,9 @@ module sp_control_mod
 
     ! data for section alchemy
     type(s_alch_info)     :: alch_info
+
+    ! data for section rigidbody
+    type(s_rgbd_info)     :: rgbd_info
 
     ! add more parameters here
 
@@ -277,6 +281,11 @@ contains
     ! read constraints section
     !
     call read_ctrl_constraints(handle, ctrl_data%cons_info)
+
+
+    ! read rigidbody section
+    !
+    call read_ctrl_rigidbody(handle, ctrl_data%rgbd_info)
 
 
     ! read ensemble section
