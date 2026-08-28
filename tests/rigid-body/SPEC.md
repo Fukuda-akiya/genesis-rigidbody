@@ -35,7 +35,9 @@ gREST(generalized REST2, solute tempering REMD)シミュレーションにおい
 
 現在の GENESIS ソースに rigid-body 機能は存在しない。最も近い既存機構は SETTLE(水分子の剛体拘束)と SHAKE/RATTLE(結合長拘束)であり、これらの実装パターンを踏襲する。
 
-**2026-08-27 追加決定**: `communicate_constraints`(MPIランク間の水/HGroup移行データ交換)への剛体対応拡張は高リスクなため、まず `mpirun -np 1` で完全に動作・検証することを優先し、np>1(ランクをまたぐ剛体移動)対応は明示的に別フェーズとする。gRESTの実運用システムサイズが単一ランクに収まるかは別途要確認。
+**2026-08-27 追加決定**: `communicate_constraints`(MPIランク間の水/HGroup移行データ交換)への剛体対応拡張は高リスクなため、まず `mpirun -np 1` で完全に動作・検証することを優先し、np>1(ランクをまたぐ剛体移動)対応は明示的に別フェーズとする。
+
+**2026-08-28 追記**: 上記np>1対応を実装し、`mpirun -np 2`の実機エンドツーエンド検証まで完了(§8b参照)。
 
 ## 2. 合意済みスコープ
 
@@ -163,7 +165,7 @@ VV2相当(各内側ステップ j):
   - `rigidbody_force_torque` — 剛体の現在COM周りの正味力・トルクを構成原子のforce配列から集計。
   - `propagate_rigidbody_vv1`/`propagate_rigidbody_vv2` — RESPA内側ループの各innerステップで、`force_short`は毎ステップ、`force_long`は外側ブロック境界でのみ半キック(既存の`nve_vv1`/`nve_vv2`の点粒子分割と同一パターン)。回転ドリフトは**body-frame角速度の指数写像**(`quat_rotate_by_body_omega`、SO(3)の幾何学的積分子。当初は線形化四元数微分(オイラー法)を使っていたが、エネルギー保存性を検証した際に不十分と判明し置き換えた。詳細は下記の検証結果参照)。
   - `initialize_rigidbody_state` — シミュレーション開始時(`vverlet_respa_dynamics`内、`initial_vverlet`/リスタート読み込みの直後)に1回、現在の原子座標・速度から各剛体のcom/vel_com/quat/angmomを初期化。姿勢は`fit_rigidbody_quat`(Kearsley/Kabsch四元数法、`fitting.fpp`の`fit_trrot`と同じLAPACK `dsyev`方式だが密な1..n配列に対応させた独自実装)で参照座標を実際の初期構造にフィッティングして決定。
-  - `nve_vv1`/`nve_vv2`/`integrate_vv1`/`integrate_vv2`/`vverlet_respa_dynamics`に`rigidbody`(optional)引数を追加し配線。**NVEアンサンブルのみ対応**(NVT/NPTと組み合わせた場合は`integrate_vv1`がsetup時ではなくrun時にエラー終了する — 下記follow-up参照)。
+  - `nve_vv1`/`nve_vv2`/`integrate_vv1`/`integrate_vv2`/`vverlet_respa_dynamics`に`rigidbody`(optional)引数を追加し配線。当初はNVEのみ対応だったが、2026-08-28にNVT(Bussi/Berendsen/NHC)対応を追加(下記)。NPT・Langevinは引き続き`integrate_vv1`がrun時にエラー終了する。
 - [x] `sp_dynamics.fpp` での `rigidbody` の `run_md` への伝搬、自由度調整(`update_num_deg_freedom`で剛体原子の3N自由度を6/bodyに置換)実装済み。
 - [x] `sp_setup_spdyn.fpp` での `setup_rigidbody_spdyn` 呼び出し配線(`setup_spdyn_md`、FEPと非FEPの両方の`setup_domain`分岐に対応)実装済み。
 - [x] **合成系での物理検証(np=1)実施・全項目PASS**:
@@ -173,11 +175,30 @@ VV2相当(各内側ステップ j):
     - 全系運動エネルギー(並進+回転)が1%以内で保存(下記の積分精度の議論を参照)
     - 全系角運動量(space frame)が厳密に保存(外部トルクゼロ、実装の整合性チェック)
   - **積分精度に関する発見**: 剛体の回転運動は「各ステップ開始時のbody-frame角速度で指数写像により厳密に1軸回転させる」方式であり、真の自由回転(Euler方程式)ではステップ内でも角速度自体が連続的に変化する(トルクフリー歳差運動)ため、この方式は1次精度の近似となる。実測: dt=1e-3(20 time units、意図的に大きな初期角速度)でエネルギードリフト約0.81%、dt=2e-4(5倍小さく、同じ総シミュレーション時間)で約0.16%と、O(dt)にほぼ比例して縮小することを確認 — バグではなく真の離散化誤差であることを検証済み。gRESTの実用条件(現実的なMDタイムステップ、熱的な回転速度)ではこのテストよりはるかに小さいドリフトが期待されるが、完全にシンプレクティックな複数副ステップ回転積分子(DLM/NO_SQUISH方式など)は未実装(follow-up)。
+  - **開発中に発見・修正した重大なバグ**: `propagate_rigidbody_vv1`のトルク計算が当初`domain%coord`を直接読んでいたが、同じステップ内で先行する点粒子の素朴なkick+driftループ(`nve_vv1`/`vel_rescaling_thermostat_vv1`内)が剛体構成原子の`domain%coord`も(物理的に無意味な値で)上書きしてしまうため、トルクの梃子腕(lever arm)`r = coord - com`が汚染されたデータで計算されていた。外力ゼロの`test_free_rigidbody`ではトルク自体が常にゼロになるため検出されず、質量比例な外力(重力)を課す新規テスト`test_gravity_torque_free`(正味トルクは解析的に厳密ゼロのはず)を追加して初めて発覚。修正: 力評価時点の座標を保持している`domain%coord_ref`を読むよう変更(`rigidbody_force_torque`に`coord`配列を明示引数として追加)。修正前は角運動量ドリフトが系のスケールに対して非常に大きく(検出不能なレベルではない)、修正後はドリフトが厳密にゼロになることを確認。
+
+- [x] **NVT(Bussi/Berendsen/NHC)対応(2026-08-28)実装・検証済み**:
+  - `sp_constraints.fpp`の`compute_kin_group`(RESPAの運動エネルギー算出で使われる「グループ運動エネルギー」計算、`group_tp`の有無に関わらず`nve_vv1`/`vel_rescaling_thermostat_vv1`から常に呼ばれる)に剛体対応を追加。**重要な発見**: 剛体構成原子は`constraints%duplicate`マークにより`nsolute`(通常のsolute原子カウント)からも`HGr`/`water`からも除外されているため、この関数は元々剛体の運動エネルギー寄与を完全に無視していた(サイレントな過小評価)。水/HGroupが「内部拘束自由度をゼロとして無視」するのに対し、剛体は回転の3自由度が本物の(無視してはいけない)自由度であるため、`mass*vel_com^2 + omega_space・angmom_space`(並進+回転の全6自由度分)を追加する形で対応。
+  - `sp_md_respa.fpp`に`write_rigidbody_vel_half_estimate`(半キック速度推定値`vel_half`への剛体対応。`ensemble%group_tp = NO`の場合に使われる`calc_kinetic`パスのため)、`rescale_rigidbody_velocity`(サーモスタットのスケール係数を`rigidbody_vel_com`/`rigidbody_angmom`にも適用)を追加。`vel_rescaling_thermostat_vv1`にこれらと`propagate_rigidbody_vv1`呼び出しを配線。
+  - `integrate_vv1`のアンサンブル制限を緩和: NVE、またはNVT+tpcontrol=Bussi/Berendsen/NHCを許可(Langevin/NPTは引き続きrun時エラー)。
+  - `tests/rigid-body/test_rigidbody_dynamics.f90`に`test_gravity_torque_free`を追加(上記バグの回帰テストとして機能。角運動量の厳密保存、COMの正しい等加速度運動(射影運動)、剛体性を検証、全PASS)。
+  - **未検証の範囲**: `vel_rescaling_thermostat_vv1`本体(Bussi/Berendsen/NHCの実際のスケール係数計算ロジック自体)を経由したエンドツーエンドのNVT実行(`s_ensemble`/`s_dynvars`/乱数種等を伴う完全な統合テスト)は未実施。今回検証したのは、その前後で必要になる剛体側の運動エネルギー計算・速度スケーリング・力/トルク計算の各要素(最もリスクが高い部分)であり、サーモスタットの温度収束挙動そのものの実測は次のステップ。
+
+## 8b. np>1 対応(2026-08-28実装・実機検証済み)
+
+- **`sp_communicate.fpp`の`communicate_constraints`に剛体の移行データ送受信を実装**。既存のwater/HGroup送受信パターン(3次元カスケード通信、`ii=3,1,-1`ループ、lower/upper双方向、ヘッダー個数スロット+固定長レコードのパック/アンパック)を忠実に踏襲。剛体は1体につき`6*max_natom+13`個のreal(構成原子ごとのcoord+velocity 6個 × natom、+ com/vel_com/quat/angmomの13個)+1個のint(グローバル剛体ID)の固定長レコードとしてwaterと全く同じ形式でパックする設計。`domain%rigidbody%move`系のヘッダースロットは`constraints%connect+3`番目に追加(`rigidbody%is_used`が全ランクで一致するため、レイアウトはランク間で常に整合)。通信バッファ(`comm%buf_send`/`int_send`)の既存サイズ見積もり(`8*MaxAtom*max_cell`)に対して、剛体1体あたりの実質ペイロードは同じ原子数を通常soluteとして送る場合より小さいため、既存の割り当てで十分と判断(防御的なオーバーフローチェックも追加)。
+- **`mpirun -np 2`での実機エンドツーエンド検証を実施**(`tests/rigid-body/np2_test/`): 手作業で構築した最小限の自己完結GROMACS形式トポロジー(結合なし、3原子の剛体+4個の背景原子、LJ相互作用のみ、電荷ゼロ)を用い、剛体をドメイン境界(x=30Å、`domain_x=2`)付近に配置し、近傍の「押し出し原子」からのLJ反発で境界を越えて加速させた。結果:
+  - 200フレームの全トラジェクトリで剛体内原子間距離の最大偏差 **0.000002Å**(浮動小数点精度レベル、実質的に完全な剛体性)。
+  - 代表原子のx座標は28.6〜41.9Åの範囲でドメイン境界(x=30)を**複数回正しく往復**(周期境界条件でバウンドする押し出し原子により、剛体が繰り返しランク0↔ランク1間を移動)。
+  - 実行は正常終了(exit code 0)、`comm_migrate`タイマーに非ゼロの時間が計上され、実際に移行処理が実行されたことを確認。
+  - **観測された既知の挙動**: 境界通過に近いタイミングで、エネルギー出力に1ステップ限りの小さな遷移的変動(全エネルギーで約2.3%、直後に新しい安定値へ復帰、その後は成長・発散せず4000ステップ全体で安定)が見られた。これはペアリストが`nbupdate_period`ごとにしか更新されないことに起因する、セル/ドメイン再割当て直後の一時的な力場評価の近似誤差であり、通常粒子でも起こりうるドメイン分割MDコード一般の既知の特性と考えられる(剛体固有のバグではないと判断: もしデータ破損があれば剛体性が破れるはずだが、遷移の前後で剛体性は完璧に保たれている)。
+  - 検証用の一式(`system.top`, `system.gro`, `np2_test.inp`, `index_np2.dat`, `ref_np2.dat`, `read_dcd.py`)は`tests/rigid-body/np2_test/`に保存済み。GROMACS形式トポロジーを使う際の実務上の注意点(spdynは`[exclusions]`セクションを無視する、VRES積分器は`electrostatic=CUTOFF`単体では`elec_long_period>1`を使えず`Multi-step is available only with PME`エラーになる、`thermostat_period`/`barostat_period`は`elec_long_period`の倍数である必要がある、剛体内原子間の意図しない巨大LJ反発を避けるにはsigmaを原子種ごとに差別化する必要がある、など)も併せて記録。
 
 ## 9. 既知の制限・follow-up課題
 
-- **np>1でのMPIランク間の剛体移行が未対応**(`communicate_constraints`拡張が必要、上記§8参照)。現状はnp=1でのみ正しく動作する。
-- **NVT(Bussi/Berendsen/NHC)・NPT・Langevinサーモスタットとの組み合わせは未対応**。`integrate_vv1`が`rigidbody%is_used`かつアンサンブルがNVEでない場合に明示的にエラー終了する。理由: (1) `vel_rescaling_thermostat_vv1`(~200行、Bussi/NHCの速度スケーリング)を剛体のvel_com/angmomにも同じスケール係数を適用するよう拡張する作業が未着手、(2) `nve_vv1`の运动エネルギー・ビリアル診断出力ブロック(`eneout_period`ごとの`compute_kin_group`/`compute_virial_group`呼び出し)は剛体原子についても素の per-atom 運動エネルギー計算式を使っており、剛体の正しい6自由度運動エネルギーを反映していない(温度・圧力のレポート/サーモスタットフィードバックに使われるため、NVT/NPT対応にはこの精度問題も併せて解決する必要がある)。
+- np>1のMPIランク間剛体移行は上記§8bの通り実機検証済み。ただし検証したのは剛体が1個・小規模合成系のみであり、多数の剛体が同時に複数方向へ移行する高負荷ケースは未検証。
+- **NVT(Bussi/Berendsen/NHC)は実装済みだがエンドツーエンド未検証**(§8参照)。`vel_rescaling_thermostat_vv1`本体を通した実際の温度収束挙動の検証は未実施。
+- **NPT・Langevinサーモスタットとの組み合わせは引き続き未対応**。`integrate_vv1`が`rigidbody%is_used`かつ(アンサンブルがNVE/NVTのいずれでもない、またはNVTでもtpcontrol=Langevinの)場合に明示的にエラー終了する。理由: (1) NPTは`mtk_barostat_vv1`/`vv2`(圧力/ビリアル計算を含む、さらに複雑な拡張が必要)、(2) `compute_virial_group`(圧力のvirial計算、`ensemble%group_tp`向け)にはまだ剛体対応を追加していない(NVTでは運動エネルギーのみで十分だが、NPTには必須)、(3) Langevinサーモスタット(`langevin_thermostat_vv1`/`vv2`)は速度リスケーリング方式ではなくランダム力+摩擦項を直接force配列に加算する方式のため、別の対応方針が必要。
 - 完全にシンプレクティックな回転積分子(DLM/NO_SQUISH等)は未実装。現行の「毎ステップ指数写像1回」方式はO(dt)精度(§8の検証結果参照)。
 - リスタートファイル(.rst)への四元数・角運動量の保存は未対応(剛体を含む実行はリスタート継続不可)。
 - 剛体内部の非結合(LJ/静電)相互作用は `compute_energy`/`compute_energy_short` で計算され続ける(正味力・トルクへの寄与は相殺されるが計算コストは無駄)。最適化は見送り。

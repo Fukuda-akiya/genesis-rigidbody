@@ -18,6 +18,8 @@ module sp_constraints_mod
   use sp_dynamics_str_mod
   use sp_enefunc_str_mod
   use sp_domain_str_mod
+  use rigidbody_str_mod
+  use rigidbody_mod
   use molecules_mod
   use molecules_str_mod
   use fileio_grotop_mod
@@ -1808,7 +1810,9 @@ contains
   !======1=========2=========3=========4=========5=========6=========7=========8
 
   subroutine compute_kin_group(constraints, ncell, nwater, water_list, mass, &
-                               vel, kin, ekin)
+                               vel, kin, ekin, rigidbody, num_rigidbody,     &
+                               rigidbody_vel_com, rigidbody_quat,           &
+                               rigidbody_angmom, rigidbody_id)
 
     ! formal arguments
     type(s_constraints), target, intent(in)    :: constraints
@@ -1817,14 +1821,23 @@ contains
     real(wip),                   intent(in)    :: mass(:,:)
     real(wip),                   intent(in)    :: vel(:,:,:)
     real(dp),                    intent(inout) :: kin(:), ekin
+    type(s_rigidbody), optional, intent(in)    :: rigidbody
+    integer,            optional,intent(in)    :: num_rigidbody(:)
+    real(wip),          optional,intent(in)    :: rigidbody_vel_com(:,:,:)
+    real(wip),          optional,intent(in)    :: rigidbody_quat(:,:,:)
+    real(wip),          optional,intent(in)    :: rigidbody_angmom(:,:,:)
+    integer,            optional,intent(in)    :: rigidbody_id(:,:)
 
     ! local variables
     integer                      :: icel, i, ix, j, k, ih, connect
     integer                      :: id, omp_get_thread_num
     integer                      :: iatm(1:8), water_atom
+    integer                      :: pb, ib
     real(wip)                    :: total_mass
     real(wip)                    :: vel_cm(1:3)
     real(dp)                     :: kinetic_omp(1:3,1:nthread)
+    real(wp)                     :: q(4), rb_omega_space(3), rb_rotmat(3,3)
+    real(wp)                     :: rb_angmom_wp(3)
 
     integer,             pointer :: HGr_local(:,:), HGr_bond_list(:,:,:,:)
     integer,             pointer :: nsolute(:)
@@ -1841,7 +1854,8 @@ contains
     water_atom = constraints%water_type
 
     !$omp parallel private(id, icel, j, k, ix, total_mass, vel_cm, &
-    !$omp                  iatm, ih) 
+    !$omp                  iatm, ih, pb, ib, q, rb_omega_space, &
+    !$omp                  rb_rotmat, rb_angmom_wp)
 #ifdef OMP
     id = omp_get_thread_num()
 #else
@@ -1870,6 +1884,41 @@ contains
                                 + total_mass*vel_cm(1:3)*vel_cm(1:3)
         end do
       end do
+
+      ! rigid-body groups: unlike HGr/water above, a rigid body's
+      ! rotational motion is a genuine, non-constrained degree of freedom
+      ! (see the 6-per-body dof count in setup_spdyn_md) and must be
+      ! counted, so this adds mass*vel_com^2 (translation) PLUS
+      ! omega_space(dim)*angmom_space(dim) (rotation) per Cartesian
+      ! component, the same per-component convention the rest of this
+      ! routine uses for anisotropic (NPT) kinetic energy bookkeeping.
+      ! Note: rigid bodies have no distinct "half-step" velocity estimate
+      ! the way point atoms do (vel_half is a force-only kick estimate,
+      ! not applicable to the analytic COM/angular-momentum state), so the
+      ! same current rigidbody_vel_com/angmom is used regardless of
+      ! whether this call is computing ekin_half or ekin_full -- a minor,
+      ! documented approximation in the ekin_full + 2*ekin_half/3
+      ! estimator blend (see tests/rigid-body/SPEC.md).
+      !
+      if (present(rigidbody)) then
+        if (rigidbody%is_used) then
+          do pb = 1, num_rigidbody(icel)
+            ib = rigidbody_id(pb,icel)
+
+            kinetic_omp(1:3,id+1) = kinetic_omp(1:3,id+1) &
+                    + real(rigidbody%mass(ib),wip) &
+                      *rigidbody_vel_com(1:3,pb,icel)*rigidbody_vel_com(1:3,pb,icel)
+
+            q(1:4) = real(rigidbody_quat(1:4,pb,icel),wp)
+            rb_angmom_wp(1:3) = real(rigidbody_angmom(1:3,pb,icel),wp)
+            call rigidbody_angvel(q, rb_angmom_wp, rigidbody%inv_inertia(1:3,ib), &
+                                 rb_omega_space, rb_rotmat)
+
+            kinetic_omp(1:3,id+1) = kinetic_omp(1:3,id+1) &
+                    + real(rb_omega_space(1:3)*rb_angmom_wp(1:3),wip)
+          end do
+        end if
+      end if
 
 !ocl nosimd
       do ix = 1, nwater(icel)

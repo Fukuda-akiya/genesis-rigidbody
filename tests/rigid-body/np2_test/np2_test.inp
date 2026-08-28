@@ -1,0 +1,49 @@
+[INPUT]
+grotopfile      = system.top
+grocrdfile      = system.gro
+
+[OUTPUT]
+dcdfile         = traj.dcd
+
+[ENERGY]
+forcefield      = GROAMBER
+electrostatic   = CUTOFF
+switchdist      = 4.0
+cutoffdist      = 5.0
+pairlistdist    = 6.0
+dielec_const    = 1.0
+output_style    = GENESIS
+
+[DYNAMICS]
+integrator      = VRES
+nsteps          = 4000
+timestep        = 0.001
+eneout_period   = 100
+crdout_period   = 20
+nbupdate_period = 4
+elec_long_period = 1
+thermostat_period = 1
+barostat_period = 1
+verbose         = yes
+
+[CONSTRAINTS]
+rigid_bond      = NO
+
+[ENSEMBLE]
+ensemble        = NVE
+tpcontrol       = NO
+temperature     = 0.0
+group_tp        = NO
+
+[BOUNDARY]
+type            = PBC
+box_size_x      = 60.0
+box_size_y      = 20.0
+box_size_z      = 20.0
+domain_x        = 2
+domain_y        = 1
+domain_z        = 1
+
+[RIGIDBODY]
+indexfile       = index_np2.dat
+reffile         = ref_np2.dat

@@ -767,11 +767,23 @@ contains
       call error_msg('In VRES, ensemble%group_tp=NO does not work')
 
     if (present(rigidbody)) then
-      if (rigidbody%is_used .and. ensemble%ensemble /= EnsembleNVE) &
-        call error_msg('Integrate_VV1> [RIGIDBODY] currently supports '// &
-                        'only ensemble = NVE in the RESPA (VRES) '//      &
-                        'integrator; NVT/NPT support is not yet '//       &
-                        'implemented (see tests/rigid-body/SPEC.md)')
+      if (rigidbody%is_used) then
+        if (ensemble%ensemble == EnsembleNVT) then
+          if (ensemble%tpcontrol /= TpcontrolBussi   .and. &
+              ensemble%tpcontrol /= TpcontrolBerendsen .and. &
+              ensemble%tpcontrol /= TpcontrolNHC) &
+            call error_msg('Integrate_VV1> [RIGIDBODY] with NVT '// &
+                            'currently supports only tpcontrol = '// &
+                            'Bussi/Berendsen/NHC (not Langevin); see '// &
+                            'tests/rigid-body/SPEC.md')
+        else if (ensemble%ensemble /= EnsembleNVE) then
+          call error_msg('Integrate_VV1> [RIGIDBODY] currently supports '// &
+                          'only ensemble = NVE or NVT (Bussi/Berendsen/'//  &
+                          'NHC) in the RESPA (VRES) integrator; NPT '//     &
+                          'support is not yet implemented (see '//         &
+                          'tests/rigid-body/SPEC.md)')
+        end if
+      end if
     end if
 
     select case (ensemble%ensemble)
@@ -792,9 +804,16 @@ contains
 
       case (TpcontrolBerendsen, TpcontrolBussi, TpcontrolNHC)
 
-        call vel_rescaling_thermostat_vv1(inner_step, dt_long, dt_short,     &
-                                          dynamics, istep, istart, ensemble, &
-                                          domain, constraints, dynvars)
+        if (present(rigidbody)) then
+          call vel_rescaling_thermostat_vv1(inner_step, dt_long, dt_short,     &
+                                            dynamics, istep, istart, ensemble, &
+                                            domain, constraints, dynvars,      &
+                                            rigidbody)
+        else
+          call vel_rescaling_thermostat_vv1(inner_step, dt_long, dt_short,     &
+                                            dynamics, istep, istart, ensemble, &
+                                            domain, constraints, dynvars)
+        end if
 
       case default
 
@@ -999,22 +1018,155 @@ contains
 
   !======1=========2=========3=========4=========5=========6=========7=========8
   !
+  !  Subroutine    write_rigidbody_vel_half_estimate
+  !> @brief        fill in a rigid-body-consistent "half-kick velocity
+  !!               estimate" for rigid-body member atoms into the given
+  !!               vel_half array, matching the role vel_half plays for
+  !!               point atoms in vel_rescaling_thermostat_vv1's kinetic-
+  !!               energy estimator (ekin = ekin_full + 2*ekin_half/3):
+  !!               a temporary half_dt-scaled kick from the CURRENT force,
+  !!               applied to a scratch copy of vel_com/angmom (the real
+  !!               domain%rigidbody_vel_com/angmom are left untouched --
+  !!               this is an estimate, not a state update), then
+  !!               reconstructed per member atom via v = v_com + omega x r
+  !!               using the CURRENT com/orientation (no drift). Without
+  !!               this, vel_half's caller-side per-atom formula (each
+  !!               atom's own naive force/mass kick) would silently feed a
+  !!               physically wrong estimate into the thermostat when
+  !!               ensemble%group_tp = NO (the calc_kinetic path; the
+  !!               group_tp = YES path uses compute_kin_group, which
+  !!               already substitutes the exact analytic rigid-body
+  !!               kinetic energy and ignores vel_half's rigid-body atom
+  !!               slots entirely).
+  !! @authors      Genesis Developers
+  !! @param[in]    rigidbody : rigid-body information
+  !! @param[in]    domain    : domain information
+  !! @param[in]    half_dt   : half timestep to scale the estimated kick by
+  !! @param[inout] vel_half  : half-kick velocity estimate array to fill
+  !!                           in for rigid-body member atoms
+  !
+  !======1=========2=========3=========4=========5=========6=========7=========8
+
+  subroutine write_rigidbody_vel_half_estimate(rigidbody, domain, half_dt, &
+                                               vel_half)
+
+    ! formal arguments
+    type(s_rigidbody), intent(in)    :: rigidbody
+    type(s_domain),     intent(in)    :: domain
+    real(wip),          intent(in)    :: half_dt
+    real(wip),          intent(inout) :: vel_half(:,:,:)
+
+    ! local variables
+    integer                  :: i, pb, ib, k, ix, n
+    real(wp)                 :: force_net(3), torque_net(3)
+    real(wp)                 :: vel_com_half(3), angmom_half(3)
+    real(wp)                 :: q(4), omega_space(3), rotmat(3,3), r(3)
+
+
+    do i = 1, domain%num_cell_local
+      do pb = 1, domain%num_rigidbody(i)
+
+        ib = domain%rigidbody_id(pb,i)
+        n  = rigidbody%natom(ib)
+
+        call rigidbody_force_torque(rigidbody, ib, domain, pb, i, &
+                                    domain%coord, domain%force, &
+                                    force_net, torque_net)
+
+        vel_com_half(1:3) = real(domain%rigidbody_vel_com(1:3,pb,i),wp) &
+                           + real(half_dt,wp)*rigidbody%inv_mass(ib)*force_net(1:3)
+        angmom_half(1:3)  = real(domain%rigidbody_angmom(1:3,pb,i),wp) &
+                           + real(half_dt,wp)*torque_net(1:3)
+
+        q(1:4) = real(domain%rigidbody_quat(1:4,pb,i),wp)
+        call rigidbody_angvel(q, angmom_half, rigidbody%inv_inertia(1:3,ib), &
+                              omega_space, rotmat)
+
+        do k = 1, n
+          ix = domain%rigidbody_atom(k,pb,i)
+          r(1:3) = real(domain%coord(1:3,ix,i),wp) &
+                 - real(domain%rigidbody_com(1:3,pb,i),wp)
+          vel_half(1,ix,i) = real(vel_com_half(1) + omega_space(2)*r(3) &
+                                                    - omega_space(3)*r(2), wip)
+          vel_half(2,ix,i) = real(vel_com_half(2) + omega_space(3)*r(1) &
+                                                    - omega_space(1)*r(3), wip)
+          vel_half(3,ix,i) = real(vel_com_half(3) + omega_space(1)*r(2) &
+                                                    - omega_space(2)*r(1), wip)
+        end do
+
+      end do
+    end do
+
+    return
+
+  end subroutine write_rigidbody_vel_half_estimate
+
+  !======1=========2=========3=========4=========5=========6=========7=========8
+  !
+  !  Subroutine    rescale_rigidbody_velocity
+  !> @brief        multiply every local rigid body's COM velocity and
+  !!               angular momentum by a thermostat scale factor; the
+  !!               member atoms' domain%velocity is intentionally left
+  !!               untouched here -- it is rebuilt from these rescaled
+  !!               values on the next write_rigidbody_atoms call
+  !! @authors      Genesis Developers
+  !
+  !======1=========2=========3=========4=========5=========6=========7=========8
+
+  subroutine rescale_rigidbody_velocity(domain, scale_vel)
+
+    ! formal arguments
+    type(s_domain), intent(inout) :: domain
+    real(wp),        intent(in)    :: scale_vel
+
+    ! local variables
+    integer                  :: i, pb
+
+
+    do i = 1, domain%num_cell_local
+      do pb = 1, domain%num_rigidbody(i)
+        domain%rigidbody_vel_com(1:3,pb,i) = domain%rigidbody_vel_com(1:3,pb,i) &
+                                            * real(scale_vel,wip)
+        domain%rigidbody_angmom(1:3,pb,i)  = domain%rigidbody_angmom(1:3,pb,i)  &
+                                            * real(scale_vel,wip)
+      end do
+    end do
+
+    return
+
+  end subroutine rescale_rigidbody_velocity
+
+  !======1=========2=========3=========4=========5=========6=========7=========8
+  !
   !  Subroutine    rigidbody_force_torque
   !> @brief        net force and torque (about the body's current COM) from
   !!               one force array (force_short or force_long), summed over
   !!               a rigid body's member atoms
   !! @authors      Genesis Developers
+  !! @param[in]    coord : coordinate array to use for the lever arm r
+  !!                       (COM to atom); callers MUST pass the coordinate
+  !!                       array that was current when `force` was computed
+  !!                       -- e.g. domain%coord_ref (not domain%coord) when
+  !!                       called from propagate_rigidbody_vv1, because the
+  !!                       point-particle per-atom kick+drift earlier in
+  !!                       that same step already overwrote domain%coord
+  !!                       for these atom slots with a physically
+  !!                       meaningless value (harmless there since it is
+  !!                       about to be overwritten again by
+  !!                       write_rigidbody_atoms, but wrong to read from
+  !!                       for a force/torque evaluation)
   !
   !======1=========2=========3=========4=========5=========6=========7=========8
 
-  subroutine rigidbody_force_torque(rigidbody, ib, domain, pb, icel, force, &
-                                    force_net, torque_net)
+  subroutine rigidbody_force_torque(rigidbody, ib, domain, pb, icel, coord, &
+                                    force, force_net, torque_net)
 
     ! formal arguments
     type(s_rigidbody), intent(in)  :: rigidbody
     integer,            intent(in)  :: ib
     type(s_domain),     intent(in)  :: domain
     integer,            intent(in)  :: pb, icel
+    real(wip),          intent(in)  :: coord(:,:,:)
     real(wip),          intent(in)  :: force(:,:,:)
     real(wp),           intent(out) :: force_net(3), torque_net(3)
 
@@ -1030,7 +1182,7 @@ contains
     do k = 1, n
       ix = domain%rigidbody_atom(k,pb,icel)
       f(1:3) = real(force(1:3,ix,icel),wp)
-      r(1:3) = real(domain%coord(1:3,ix,icel),wp) &
+      r(1:3) = real(coord(1:3,ix,icel),wp) &
              - real(domain%rigidbody_com(1:3,pb,icel),wp)
 
       force_net(1:3)  = force_net(1:3) + f(1:3)
@@ -1090,9 +1242,17 @@ contains
 
         ib = domain%rigidbody_id(pb,i)
 
-        ! half-kick with the short-range force (every inner step)
+        ! half-kick with the short-range force (every inner step). Uses
+        ! domain%coord_ref, not domain%coord, for the lever arm: the
+        ! point-particle per-atom kick+drift earlier in nve_vv1/
+        ! vel_rescaling_thermostat_vv1 already overwrote domain%coord for
+        ! these atom slots this step (harmlessly, since write_rigidbody_atoms
+        ! below overwrites it again) -- coord_ref still holds the
+        ! coordinates as of the force evaluation, which is what a
+        ! force/torque calculation must use.
         call rigidbody_force_torque(rigidbody, ib, domain, pb, i, &
-                                    domain%force_short, force_net, torque_net)
+                                    domain%coord_ref, domain%force_short, &
+                                    force_net, torque_net)
         domain%rigidbody_vel_com(1:3,pb,i) = domain%rigidbody_vel_com(1:3,pb,i) &
                         + half_dt_short * rigidbody%inv_mass(ib) * force_net(1:3)
         domain%rigidbody_angmom(1:3,pb,i)  = domain%rigidbody_angmom(1:3,pb,i) &
@@ -1102,7 +1262,8 @@ contains
         ! boundary, mirroring the point-particle nve_vv1 split)
         if (apply_long) then
           call rigidbody_force_torque(rigidbody, ib, domain, pb, i, &
-                                      domain%force_long, force_net, torque_net)
+                                      domain%coord_ref, domain%force_long, &
+                                      force_net, torque_net)
           domain%rigidbody_vel_com(1:3,pb,i) = domain%rigidbody_vel_com(1:3,pb,i) &
                           + half_dt_long * rigidbody%inv_mass(ib) * force_net(1:3)
           domain%rigidbody_angmom(1:3,pb,i)  = domain%rigidbody_angmom(1:3,pb,i) &
@@ -1174,8 +1335,13 @@ contains
 
         ib = domain%rigidbody_id(pb,i)
 
+        ! domain%coord is correct (uncorrupted) here: unlike VV1, nothing
+        ! in nve_vv2/vel_rescaling_thermostat_vv2's point-particle path
+        ! touches coordinates (VV2 only updates velocity), so it still
+        ! matches the coordinates VV1 left after its own drift.
         call rigidbody_force_torque(rigidbody, ib, domain, pb, i, &
-                                    domain%force_short, force_net, torque_net)
+                                    domain%coord, domain%force_short, &
+                                    force_net, torque_net)
         domain%rigidbody_vel_com(1:3,pb,i) = domain%rigidbody_vel_com(1:3,pb,i) &
                         + half_dt_short * rigidbody%inv_mass(ib) * force_net(1:3)
         domain%rigidbody_angmom(1:3,pb,i)  = domain%rigidbody_angmom(1:3,pb,i) &
@@ -1183,7 +1349,8 @@ contains
 
         if (inner_step == elec_long_period) then
           call rigidbody_force_torque(rigidbody, ib, domain, pb, i, &
-                                      domain%force_long, force_net, torque_net)
+                                      domain%coord, domain%force_long, &
+                                      force_net, torque_net)
           domain%rigidbody_vel_com(1:3,pb,i) = domain%rigidbody_vel_com(1:3,pb,i) &
                           + half_dt_long * rigidbody%inv_mass(ib) * force_net(1:3)
           domain%rigidbody_angmom(1:3,pb,i)  = domain%rigidbody_angmom(1:3,pb,i) &
@@ -1435,10 +1602,23 @@ contains
       end do
       !$omp end parallel do
 
-      call compute_kin_group(constraints, ncell, nwater, water_list, &
-                             mass, vel_half, kin_half, ekin_half)
-      call compute_kin_group(constraints, ncell, nwater, water_list, &
-                             mass, vel, kin_full, ekin_full)
+      if (present(rigidbody)) then
+        call compute_kin_group(constraints, ncell, nwater, water_list, &
+                               mass, vel_half, kin_half, ekin_half, rigidbody, &
+                               domain%num_rigidbody, domain%rigidbody_vel_com, &
+                               domain%rigidbody_quat, domain%rigidbody_angmom, &
+                               domain%rigidbody_id)
+        call compute_kin_group(constraints, ncell, nwater, water_list, &
+                               mass, vel, kin_full, ekin_full, rigidbody, &
+                               domain%num_rigidbody, domain%rigidbody_vel_com, &
+                               domain%rigidbody_quat, domain%rigidbody_angmom, &
+                               domain%rigidbody_id)
+      else
+        call compute_kin_group(constraints, ncell, nwater, water_list, &
+                               mass, vel_half, kin_half, ekin_half)
+        call compute_kin_group(constraints, ncell, nwater, water_list, &
+                               mass, vel, kin_full, ekin_full)
+      end if
       ekin = ekin_full + 2.0_dp*ekin_half/3.0_dp
       kin(1:3) = kin_full(1:3) + kin_half(1:3)
 
@@ -1639,7 +1819,8 @@ contains
 
   subroutine vel_rescaling_thermostat_vv1(inner_step, dt_long, dt_short,      &
                                           dynamics, istep, istart, ensemble,  &
-                                          domain, constraints, dynvars)
+                                          domain, constraints, dynvars,      &
+                                          rigidbody)
 
     ! formal arguments
     integer,                 intent(in)    :: inner_step
@@ -1652,6 +1833,7 @@ contains
     type(s_domain),  target, intent(inout) :: domain
     type(s_constraints),     intent(inout) :: constraints
     type(s_dynvars), target, intent(inout) :: dynvars
+    type(s_rigidbody), optional, intent(in) :: rigidbody
 
     ! local variables
     logical                  :: calc_thermostat
@@ -1741,11 +1923,39 @@ contains
           vel_half(3,ix,i) = factor*force(3,ix,i)
         end do
       end do
+
+      ! the loop above wrote a per-atom, force/mass-only half-kick
+      ! estimate into vel_half -- physically wrong for rigid-body member
+      ! atoms, so overwrite those slots with a proper rigid-body half-kick
+      ! estimate (see write_rigidbody_vel_half_estimate). Only matters for
+      ! the group_tp = NO / calc_kinetic path below: compute_kin_group
+      ! ignores vel_half's rigid-body atom slots entirely and substitutes
+      ! the exact analytic rigid-body kinetic energy instead.
+      !
+      if (present(rigidbody)) then
+        if (rigidbody%is_used) &
+          call write_rigidbody_vel_half_estimate(rigidbody, domain, &
+                                                  half_dt_short, vel_half)
+      end if
+
       if (ensemble%group_tp) then
-        call compute_kin_group(constraints, ncell, nwater, water_list, mass, &
-                               vel_half, kin_half, ekin_half)
-        call compute_kin_group(constraints, ncell, nwater, water_list, mass, &
-                               vel_ref, kin_full, ekin_full)
+        if (present(rigidbody)) then
+          call compute_kin_group(constraints, ncell, nwater, water_list, mass, &
+                                 vel_half, kin_half, ekin_half, rigidbody,      &
+                                 domain%num_rigidbody, domain%rigidbody_vel_com, &
+                                 domain%rigidbody_quat, domain%rigidbody_angmom, &
+                                 domain%rigidbody_id)
+          call compute_kin_group(constraints, ncell, nwater, water_list, mass, &
+                                 vel_ref, kin_full, ekin_full, rigidbody,       &
+                                 domain%num_rigidbody, domain%rigidbody_vel_com, &
+                                 domain%rigidbody_quat, domain%rigidbody_angmom, &
+                                 domain%rigidbody_id)
+        else
+          call compute_kin_group(constraints, ncell, nwater, water_list, mass, &
+                                 vel_half, kin_half, ekin_half)
+          call compute_kin_group(constraints, ncell, nwater, water_list, mass, &
+                                 vel_ref, kin_full, ekin_full)
+        end if
       else
         call calc_kinetic(ncell, natom, mass, vel_half, kin_half, ekin_half)
         call calc_kinetic(ncell, natom, mass, vel_ref, kin_full, ekin_full)
@@ -1787,7 +1997,18 @@ contains
         end do
       end do
     end if
- 
+
+    ! rescale each rigid body's own COM velocity and angular momentum by
+    ! the same factor -- the per-atom scaling above (either branch) does
+    ! not persist for rigid-body atoms, since their domain%velocity is
+    ! overwritten from rigidbody_vel_com/angmom again in the VV1 step
+    ! immediately below (propagate_rigidbody_vv1 -> write_rigidbody_atoms)
+    !
+    if (present(rigidbody)) then
+      if (rigidbody%is_used) &
+        call rescale_rigidbody_velocity(domain, real(scale_vel,wp))
+    end if
+
     ! VV1
     if (inner_step == 1) then
 
@@ -1824,6 +2045,18 @@ contains
       call compute_constraints(ConstraintModeLEAP, .true., dt_short,  &
                                coord_ref, domain, constraints, coord, &
                                vel, viri_const)
+    end if
+
+    ! rigid-body VV1 (kick with the current force, then drift); the
+    ! thermostat rescale of rigidbody_vel_com/angmom above already ran,
+    ! so this mirrors how the point-particle kick+drift above follows
+    ! this routine's own velocity rescale block
+    !
+    if (present(rigidbody)) then
+      if (rigidbody%is_used) &
+        call propagate_rigidbody_vv1(rigidbody, domain, istep, &
+                                     dynamics%elec_long_period, &
+                                     dt_long, dt_short)
     end if
 
     if (mod(istep-1, dynamics%eneout_period) == 0 .and. ensemble%group_tp) then

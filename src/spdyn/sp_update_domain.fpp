@@ -135,7 +135,11 @@ contains
       end if
 
       call timer(TimerComm3, TimerOn)
-      call communicate_constraints(domain, comm, constraints)
+      if (present(rigidbody)) then
+        call communicate_constraints(domain, comm, constraints, rigidbody)
+      else
+        call communicate_constraints(domain, comm, constraints)
+      end if
       call timer(TimerComm3, TimerOff)
 
       call update_incoming_atom (constraints, domain)

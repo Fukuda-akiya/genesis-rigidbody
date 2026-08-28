@@ -1,0 +1,55 @@
+; Minimal, self-contained GROMACS-format topology for a np>1 (MPI cross-rank
+; rigid-body migration) verification test. No bonded terms are needed: the
+; only thing under test is whether a 3-atom rigid body correctly migrates
+; from one MPI domain to another as its center of mass crosses the domain
+; boundary along x, pushed there by LJ repulsion from a nearby "pusher" atom
+; (deterministic: initial velocities are all zero, so no RNG dependency).
+;
+; Units are native GROMACS (nm, kJ/mol); GENESIS converts internally to its
+; own units (Angstrom, kcal/mol).
+
+[ defaults ]
+; nbfunc  comb-rule  gen-pairs  fudgeLJ  fudgeQQ
+1         2          no         1.0      1.0
+
+; RA's sigma is deliberately tiny: spdyn does not honor this file's
+; [exclusions] section (confirmed at runtime: "has [exclusions] list in
+; grotop, but it is not used in spdyn"), and GENESIS's [RIGIDBODY] feature
+; itself does not exclude intra-body nonbonded interactions either (see
+; tests/rigid-body/SPEC.md) -- so the 3 rigid-body atoms, ~0.6-0.8 A apart,
+; would otherwise repel each other with an enormous, physically
+; meaningless LJ force. With sigma_RA this small, the Lorentz-Berthelot
+; combination sigma_RA-RA = sigma_RA stays far below the actual intra-body
+; separation (negligible self-interaction), while sigma_RA-BG =
+; (sigma_RA+sigma_BG)/2 stays large enough to give a real repulsive push
+; from the separate "pusher" (BG) atom a few Angstrom away.
+[ atomtypes ]
+; name    mass      charge   ptype  sigma    epsilon
+RA        12.0000   0.0000   A      0.0500   1.5000
+BG        12.0000   0.0000   A      0.6500   1.5000
+
+[ moleculetype ]
+; name  nrexcl
+RIG     1
+
+[ atoms ]
+; nr  type  resnr  residue  atom  cgnr  charge
+1     RA    1      RIG      A1    1     0.0
+2     RA    1      RIG      A2    1     0.0
+3     RA    1      RIG      A3    1     0.0
+
+[ moleculetype ]
+; name  nrexcl
+BGM     1
+
+[ atoms ]
+; nr  type  resnr  residue  atom  cgnr  charge
+1     BG    1      BGM      B1    1     0.0
+
+[ system ]
+np2 rigidbody migration test
+
+[ molecules ]
+; Compound   #mols
+RIG          1
+BGM          3

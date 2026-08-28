@@ -18,6 +18,7 @@ module sp_communicate_mod
   use sp_boundary_str_mod
   use sp_enefunc_str_mod
   use sp_domain_str_mod
+  use rigidbody_str_mod
   use timers_mod
   use messages_mod
   use mpi_parallel_mod
@@ -1121,12 +1122,13 @@ contains
   !
   !======1=========2=========3=========4=========5=========6=========7=========8
 
-  subroutine communicate_constraints(domain, comm, constraints)
+  subroutine communicate_constraints(domain, comm, constraints, rigidbody)
 
     ! formal arguments
     type(s_domain),      target, intent(inout) :: domain
     type(s_comm),        target, intent(inout) :: comm
     type(s_constraints), target, intent(inout) :: constraints
+    type(s_rigidbody), optional, intent(in)    :: rigidbody
 
     ! local variable
     integer                      :: send_size(2,2), recv_size(2,2)
@@ -1135,12 +1137,15 @@ contains
     integer                      :: list, list1, size
     integer                      :: irequest, irequest1, irequest2, irequest3
     integer                      :: irequest4, irequest5, irequest6, irequest7
+    logical                      :: use_rigidbody
+    integer                      :: rb_real_size, rb_hdr
 #ifdef HAVE_MPI_GENESIS
     integer                      :: istatus(mpi_status_size)
 #endif
     real(wip),           pointer :: buf_send(:,:), buf_recv(:,:)
     real(wip),           pointer :: buf_real(:,:,:), water_move_real(:,:,:)
     real(wip),           pointer :: HGr_move_real(:,:,:,:)
+    real(wip),           pointer :: rb_move_real(:,:,:)
     integer,             pointer :: if_lower_send(:,:), if_upper_send(:,:)
     integer,             pointer :: if_lower_recv(:,:), if_upper_recv(:,:)
     integer,             pointer :: iproc_upper(:), iproc_lower(:), num_cell(:)
@@ -1148,6 +1153,7 @@ contains
     integer,             pointer :: buf_int(:,:,:), water_move_int(:,:,:)
     integer,             pointer :: HGr_move(:,:), HGr_move_int(:,:,:,:)
     integer,             pointer :: int_send(:,:), int_recv(:,:)
+    integer,             pointer :: rb_move(:), rb_move_int(:,:,:)
 
 
     iproc_upper     => domain%iproc_upper
@@ -1173,6 +1179,16 @@ contains
     HGr_move_int    => constraints%HGr_move_int
     HGr_move_real   => constraints%HGr_move_real
 
+    use_rigidbody = .false.
+    if (present(rigidbody)) use_rigidbody = rigidbody%is_used
+
+    if (use_rigidbody) then
+      rb_move      => domain%rigidbody%move
+      rb_move_real => domain%rigidbody%move_real
+      rb_move_int  => domain%rigidbody%move_integer
+      rb_real_size = 6*rigidbody%max_natom + 13
+    end if
+
     if (constraints%water_type == TIP4) then
       water_atom = 4
     else if (constraints%water_type == TIP3) then
@@ -1183,7 +1199,17 @@ contains
       water_atom = 1
     end if
 
-    size = constraints%connect + 2
+    ! rb_hdr is the header slot index (within each cell's `size`-wide
+    ! header block) that carries the outgoing rigid-body count; when
+    ! rigid bodies are not in use, `size` and the header layout are
+    ! unchanged from before this feature existed
+    if (use_rigidbody) then
+      size   = constraints%connect + 3
+      rb_hdr = constraints%connect + 3
+    else
+      size = constraints%connect + 2
+    end if
+
     do ii = 3, 1, -1
 
       ! Pack outgoing data (lower)
@@ -1199,6 +1225,8 @@ contains
         do j = 1, constraints%connect
           int_send(size*(i-1)+j+2,1) = HGr_move(j,ic)
         end do
+
+        if (use_rigidbody) int_send(size*(i-1)+rb_hdr,1) = rb_move(ic)
 
         do ix = 1, ptl_add(ic)
 
@@ -1270,6 +1298,43 @@ contains
       send_size(1,1) = int_size + water_atom*k
       send_size(2,1) = real_size + 6*water_atom*k
 
+      ! pack outgoing rigid-body data (lower), same idiom as the water
+      ! block above: one fixed-size record per body (rb_real_size reals,
+      ! 1 int carrying the global body id)
+      !
+      if (use_rigidbody) then
+
+        real_size = real_size + 6*water_atom*k
+        int_size  = int_size + water_atom*k
+
+        k = 0
+        do i = 1, num_cell(ii)
+
+          ic = if_lower_send(i,ii)
+          do ix = 1, rb_move(ic)
+
+            k = k + 1
+            do j = 1, rb_real_size
+              buf_send(real_size+rb_real_size*(k-1)+j,1) = &
+                   rb_move_real(j,ix,ic)
+            end do
+            int_send(int_size+k,1) = rb_move_int(1,ix,ic)
+
+          end do
+        end do
+
+        send_size(1,1) = int_size + k
+        send_size(2,1) = real_size + rb_real_size*k
+
+        if (send_size(2,1) > ubound(buf_send,1) .or. &
+            send_size(1,1) > ubound(int_send,1))      &
+          call error_msg('Communicate_Constraints> rigid-body migration '// &
+                          'payload exceeds the communication buffer -- '//  &
+                          'this should not happen with the current '//     &
+                          'buffer sizing; please report this')
+
+      end if
+
       ! pack the outgoing date (upper)
       !
       k = 0
@@ -1283,6 +1348,8 @@ contains
         do j = 1, constraints%connect
           int_send(size*(i-1)+j+2,2) = HGr_move(j,ic)
         end do
+
+        if (use_rigidbody) int_send(size*(i-1)+rb_hdr,2) = rb_move(ic)
 
         do ix = 1, ptl_add(ic)
 
@@ -1354,6 +1421,42 @@ contains
 
       send_size(1,2) = int_size + water_atom*k
       send_size(2,2) = real_size + 6*water_atom*k
+
+      ! pack outgoing rigid-body data (upper); see the lower-direction
+      ! block above for the layout explanation
+      !
+      if (use_rigidbody) then
+
+        real_size = real_size + 6*water_atom*k
+        int_size  = int_size + water_atom*k
+
+        k = 0
+        do i = 1, num_cell(ii)
+
+          ic = if_upper_send(i,ii)
+          do ix = 1, rb_move(ic)
+
+            k = k + 1
+            do j = 1, rb_real_size
+              buf_send(real_size+rb_real_size*(k-1)+j,2) = &
+                   rb_move_real(j,ix,ic)
+            end do
+            int_send(int_size+k,2) = rb_move_int(1,ix,ic)
+
+          end do
+        end do
+
+        send_size(1,2) = int_size + k
+        send_size(2,2) = real_size + rb_real_size*k
+
+        if (send_size(2,2) > ubound(buf_send,1) .or. &
+            send_size(1,2) > ubound(int_send,1))      &
+          call error_msg('Communicate_Constraints> rigid-body migration '// &
+                          'payload exceeds the communication buffer -- '//  &
+                          'this should not happen with the current '//     &
+                          'buffer sizing; please report this')
+
+      end if
 #ifdef HAVE_MPI_GENESIS
 
       ! send the size of data
@@ -1514,6 +1617,36 @@ contains
 
       end do
 
+      ! get the incoming rigid-body data (from upper); see the water block
+      ! above for the layout explanation
+      !
+      if (use_rigidbody) then
+
+        real_size = real_size + 6*water_atom*k
+        int_size  = int_size + water_atom*k
+
+        k = 0
+        do i = 1, num_cell(ii)
+
+          ic = if_upper_recv(i,ii)
+          nadd = int_recv(size*(i-1)+rb_hdr,1)
+
+          do ix = rb_move(ic)+1, rb_move(ic)+nadd
+
+            k = k + 1
+            do j = 1, rb_real_size
+              rb_move_real(j,ix,ic) = buf_recv(real_size+rb_real_size*(k-1)+j,1)
+            end do
+            rb_move_int(1,ix,ic) = int_recv(int_size+k,1)
+
+          end do
+
+          rb_move(ic) = rb_move(ic) + nadd
+
+        end do
+
+      end if
+
       ! get the imcoming data (from lower)
       !
       k = 0
@@ -1600,6 +1733,36 @@ contains
         water_move(ic) = water_move(ic) + nadd
 
       end do
+
+      ! get the incoming rigid-body data (from lower); see the water block
+      ! above for the layout explanation
+      !
+      if (use_rigidbody) then
+
+        real_size = real_size + 6*water_atom*k
+        int_size  = int_size + water_atom*k
+
+        k = 0
+        do i = 1, num_cell(ii)
+
+          ic = if_lower_recv(i,ii)
+          nadd = int_recv(size*(i-1)+rb_hdr,2)
+
+          do ix = rb_move(ic)+1, rb_move(ic)+nadd
+
+            k = k + 1
+            do j = 1, rb_real_size
+              rb_move_real(j,ix,ic) = buf_recv(real_size+rb_real_size*(k-1)+j,2)
+            end do
+            rb_move_int(1,ix,ic) = int_recv(int_size+k,2)
+
+          end do
+
+          rb_move(ic) = rb_move(ic) + nadd
+
+        end do
+
+      end if
 
     end do
 
